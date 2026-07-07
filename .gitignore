@@ -9,7 +9,16 @@ __pycache__/
 *.so
 .Python
 venv/
+.venv/
 env/
+
+# 測試產物
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Claude Code 本機設定
+.claude/
 
 # 日誌
 *.log

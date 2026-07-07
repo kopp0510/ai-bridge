@@ -337,7 +337,7 @@ class TestCodexProvider:
         assert self.provider.configure_hooks("", "test", "/path/to/script.sh") is False
 
     def test_remove_hooks(self):
-        """驗證移除 Stop hook 但保留其他設定"""
+        """驗證只移除 bridge 建立的 Stop hook，保留使用者自己的 hooks 與其他設定"""
         with tempfile.TemporaryDirectory() as tmpdir:
             config_dir = os.path.join(tmpdir, '.codex')
             os.makedirs(config_dir)
@@ -345,7 +345,13 @@ class TestCodexProvider:
             with open(settings_file, 'w') as f:
                 json.dump({
                     "hooks": {
-                        "Stop": [{"hooks": []}],
+                        "Stop": [
+                            # bridge 建立的 entry（command 含 TELEGRAM_SESSION_NAME=）
+                            {"hooks": [{"type": "command",
+                                        "command": "TELEGRAM_SESSION_NAME=test TELEGRAM_CLI_TYPE=codex /path/to/notify_telegram.sh"}]},
+                            # 使用者自己的 entry
+                            {"hooks": [{"type": "command", "command": "/usr/local/bin/my-own-hook.sh"}]}
+                        ],
                         "SessionStart": [{"hooks": []}]
                     }
                 }, f)
@@ -355,7 +361,10 @@ class TestCodexProvider:
             with open(settings_file, 'r') as f:
                 result = json.load(f)
 
-            assert 'Stop' not in result.get('hooks', {})
+            # bridge entry 已移除，使用者自己的 entry 保留
+            stop_entries = result['hooks']['Stop']
+            assert len(stop_entries) == 1
+            assert 'my-own-hook.sh' in stop_entries[0]['hooks'][0]['command']
             assert 'SessionStart' in result['hooks']
 
     def test_remove_hooks_no_file(self):

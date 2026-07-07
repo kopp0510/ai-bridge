@@ -14,7 +14,9 @@ HOOK_SCRIPT = os.path.join(SCRIPT_DIR, 'notify_telegram.sh')
 VENV_PYTHON = os.path.join(SCRIPT_DIR, 'venv', 'bin', 'python3')
 
 
-def run_hook(stdin_data, env_overrides=None, timeout=10):
+# timeout 與 hook 實際 timeout（30 秒）對齊：
+# 部分測試會對 api.telegram.org 發真實請求（假 token），網路慢時 10 秒不夠
+def run_hook(stdin_data, env_overrides=None, timeout=30):
     """執行 hook 腳本並返回結果"""
     env = os.environ.copy()
     env['TELEGRAM_SESSION_NAME'] = 'test-session'

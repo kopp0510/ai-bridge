@@ -20,6 +20,7 @@ sessions:
     path: /Users/username/project/gemini-project
     cli_type: gemini
     # tmux 可選，預設為 gemini-gemini-project
+    # ⚠️ --yolo 會自動核准所有操作（含檔案修改與命令執行），僅建議在沙箱/可拋棄環境使用
     cli_args: "--yolo"
 
   # 範例會話 4 - OpenAI Codex CLI

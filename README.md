@@ -18,7 +18,7 @@
 - 📊 **訊息截斷**：超過 4000 字元自動截斷，避免訊息過長
 - 🔒 **用戶驗證**：僅允許特定用戶使用
 - ⚡ **訊息佇列**：避免衝突，訊息依序處理
-- 🌐 **多語言支援**：透過 `.env` 的 `LANGUAGE` 設定切換繁體中文或英文介面
+- 🌐 **多語言支援**：透過 `.env` 的 `AI_BRIDGE_LANGUAGE` 設定切換繁體中文或英文介面
 
 ## 支援列表
 
@@ -301,13 +301,13 @@ sessions:
 ```env
 TELEGRAM_BOT_TOKEN=你的_telegram_bot_token
 ALLOWED_USER_IDS=user_id_1,user_id_2
-LANGUAGE=zh-TW
+AI_BRIDGE_LANGUAGE=zh-TW
 ```
 
 **變數說明：**
 - `TELEGRAM_BOT_TOKEN` - 必填，從 BotFather 獲取
 - `ALLOWED_USER_IDS` - 必填，逗號分隔的用戶 ID（留空將拒絕啟動）
-- `LANGUAGE` - 可選，介面語言（`zh-TW` 繁體中文 / `en` 英文，預設 `zh-TW`）
+- `AI_BRIDGE_LANGUAGE` - 可選，介面語言（`zh-TW` 繁體中文 / `en` 英文，預設 `zh-TW`）。舊鍵名 `LANGUAGE` 仍可用，但與系統 gettext 環境變數同名、可能被覆蓋
 
 ## 工作原理
 

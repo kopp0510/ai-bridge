@@ -28,7 +28,7 @@ class TestCheckTmuxInstalled:
         bridge = TmuxBridge("test")
         assert bridge.check_tmux_installed() is True
         mock_run.assert_called_once_with(
-            ['which', 'tmux'], capture_output=True, text=True
+            ['which', 'tmux'], capture_output=True, text=True, timeout=10
         )
 
     @patch('tmux_bridge.subprocess.run')
@@ -53,7 +53,7 @@ class TestSessionExists:
         assert bridge.session_exists() is True
         mock_run.assert_called_once_with(
             ['tmux', 'has-session', '-t', 'my-session'],
-            capture_output=True, text=True
+            capture_output=True, text=True, timeout=10
         )
 
     @patch('tmux_bridge.subprocess.run')

@@ -5,9 +5,9 @@ Telegram Bot - AI CLI 多會話並行橋接
 透過 Hook 機制即時接收 AI 回應
 """
 
+import asyncio
 import json
 import os
-import re
 import subprocess
 import sys
 import signal
@@ -24,10 +24,20 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 
 from collections import defaultdict
 from datetime import datetime
+import requests
 from session_manager import SessionManager
 from message_router import MessageRouter
 import hashlib
-from config import config as app_config, patterns
+from config import config as app_config, patterns, redact_token
+from status_store import (
+    mark_session_busy as _mark_session_busy,
+    get_session_busy_seconds as _get_session_busy_seconds,
+)
+from option_parser import (
+    TEXT_INPUT_KEYWORDS,
+    clean_ansi as _clean_ansi,
+    extract_options as _extract_options,
+)
 from i18n import t
 
 # 載入環境變數
@@ -92,16 +102,16 @@ SESSIONS_CONFIG_FILE = app_config.sessions_config_file
 
 
 def check_user_permission(update: Update) -> bool:
-    """檢查用戶是否有權限"""
+    """檢查用戶是否有權限（空名單一律拒絕，fail-closed）"""
     if not ALLOWED_USER_IDS:
-        return True
+        return False
     user_id = str(update.effective_user.id)
     return user_id in ALLOWED_USER_IDS
 
 
-# 速率限制：每用戶每 5 秒最多 3 則訊息
-RATE_LIMIT_WINDOW = 5
-RATE_LIMIT_MAX = 3
+# 速率限制（時間窗與上限集中於 config.py）
+RATE_LIMIT_WINDOW = app_config.rate_limit.WINDOW_SECONDS
+RATE_LIMIT_MAX = app_config.rate_limit.MAX_MESSAGES
 _rate_limit_store: dict = defaultdict(list)
 _rate_limit_lock = threading.Lock()
 
@@ -150,7 +160,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t('bot.unauthorized'))
         return
 
-    status_info = bot_state.session_manager.get_status()
+    # get_status 內含多次 tmux subprocess，移到執行緒避免阻塞 event loop
+    status_info = await asyncio.to_thread(bot_state.session_manager.get_status)
 
     lines = [t('status_cmd.title') + "\n"]
     for name, info in status_info.items():
@@ -200,8 +211,8 @@ async def restart_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(t('session.restarting', name=session_name))
 
-    # 重啟會話
-    success = bot_state.session_manager.restart_session(session_name)
+    # 重啟會話（含 kill + 重建 + 2 秒初始化等待，移到執行緒避免阻塞 event loop）
+    success = await asyncio.to_thread(bot_state.session_manager.restart_session, session_name)
 
     if success:
         await update.message.reply_text(t('session.restart_success', name=session_name))
@@ -217,8 +228,8 @@ async def reload_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(t('reload.reloading'))
 
-    # 執行重載
-    success, message, changes = reload_sessions_config()
+    # 執行重載（新增 N 個會話時每個含 2 秒初始化等待，移到執行緒避免阻塞 event loop）
+    success, message, changes = await asyncio.to_thread(reload_sessions_config)
 
     if success:
         # 格式化變更詳情
@@ -496,7 +507,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not session_name:
             return
 
-        _send_tmux_selection(session_name, choice_num)
+        # 按鍵序列含 subprocess + sleep，移到執行緒避免阻塞 event loop
+        await asyncio.to_thread(_send_tmux_selection, session_name, choice_num)
         _poll_last_sent[session_name] = time.time()
 
         await query.edit_message_text(
@@ -511,7 +523,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not session_name:
             return
 
-        _send_tmux_selection(session_name, choice_num)
+        # 按鍵序列含 subprocess + sleep，移到執行緒避免阻塞 event loop
+        await asyncio.to_thread(_send_tmux_selection, session_name, choice_num)
         _poll_last_sent[session_name] = time.time()
 
         await query.edit_message_text(
@@ -545,39 +558,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def _mark_session_busy(session_name: str) -> None:
-    """標記 session 為忙碌狀態"""
-    if not patterns.is_safe_session_name(session_name):
+def _send_telegram_text(text: str) -> None:
+    """從背景執行緒發送純文字訊息到 Telegram（worker 執行緒無法使用 async，用同步 requests）"""
+    if not bot_state.telegram_chat_id:
         return
-    status_dir = app_config.status.STATUS_DIR
-    os.makedirs(status_dir, mode=0o700, exist_ok=True)
-    busy_file = os.path.join(status_dir, f"{session_name}.busy")
     try:
-        fd = os.open(busy_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(datetime.now().isoformat())
-    except OSError as e:
-        logger.warning(f"Failed to mark session busy: {e}")
-
-
-BUSY_TIMEOUT_SECONDS = 3600  # busy 狀態超過 1 小時自動清除
-
-def _get_session_busy_seconds(session_name: str) -> int:
-    """取得 session 忙碌秒數，未忙碌返回 -1。超過 BUSY_TIMEOUT_SECONDS 自動清除。"""
-    busy_file = os.path.join(app_config.status.STATUS_DIR, f"{session_name}.busy")
-    try:
-        with open(busy_file, 'r', encoding='utf-8') as f:
-            start_time = datetime.fromisoformat(f.read().strip())
-        seconds = int((datetime.now() - start_time).total_seconds())
-        if seconds > BUSY_TIMEOUT_SECONDS:
-            try:
-                os.remove(busy_file)
-            except OSError:
-                pass
-            return -1
-        return seconds
-    except (FileNotFoundError, ValueError, OSError):
-        return -1
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        requests.post(
+            url,
+            json={"chat_id": bot_state.telegram_chat_id, "text": text},
+            timeout=app_config.telegram.API_TIMEOUT
+        )
+    except Exception as e:
+        logger.warning(f"Failed to send telegram text: {redact_token(e)}")
 
 
 def message_queue_processor():
@@ -589,9 +582,12 @@ def message_queue_processor():
 
             logger.info(t('bridge.queue_processing', session=session_name, preview=message[:50]))
 
-            # 發送到對應會話
-            bot_state.session_manager.send_to_session(session_name, message)
-            _mark_session_busy(session_name)
+            # 發送到對應會話；失敗時回報使用者且不標記 busy
+            if bot_state.session_manager.send_to_session(session_name, message):
+                _mark_session_busy(session_name)
+            else:
+                logger.error(t('bridge.send_failed', session=session_name))
+                _send_telegram_text(f"❌ {t('bridge.send_failed', session=session_name)}")
 
             time.sleep(app_config.tmux.COMMAND_DELAY)
 
@@ -721,15 +717,12 @@ def log_rotation_worker():
 
 # 互動偵測輪詢狀態
 _poll_lock = threading.Lock()
-_poll_sent_hashes: dict = {}    # {hash: True}，保持插入順序做 LRU 淘汰
-_POLL_HASH_MAX_SIZE = 1000      # hash 集合上限，防記憶體洩漏
+_poll_sent_hashes: dict = {}    # {hash: 發送時間戳}，保持插入順序做 LRU 淘汰
 _poll_last_sent: dict = {}  # {session_name: timestamp}，防短時間重複
-POLL_COOLDOWN = 30  # 同一 session 發送冷卻時間（秒）
-
-# 文字輸入選項的關鍵字（選擇後需要使用者追加輸入）
-TEXT_INPUT_KEYWORDS = ['Type something', 'Tell Claude what to change',
-                       'tell Codex what to do differently']
-
+_poll_file_state: dict = {}  # {session_name: (st_size, st_mtime)}，檔案未變化時跳過解析
+_POLL_HASH_MAX_SIZE = app_config.tmux.POLL_HASH_MAX_SIZE
+_POLL_HASH_TTL = app_config.tmux.POLL_HASH_TTL
+POLL_COOLDOWN = app_config.tmux.POLL_COOLDOWN
 
 def _capture_tmux_pane(session_name: str) -> str:
     """用 tmux capture-pane 取得渲染後的螢幕內容（適用於 ink/React TUI）"""
@@ -741,223 +734,6 @@ def _capture_tmux_pane(session_name: str) -> str:
         return result.stdout if result.returncode == 0 else ''
     except Exception:
         return ''
-
-
-def _clean_ansi(text: str) -> str:
-    """清理 ANSI escape codes 和控制字元"""
-    # 先把 cursor forward \x1b[NC] 替換為空格（TUI 用它代替空格）
-    text = re.sub(r'\x1b\[(\d+)C', lambda m: ' ' * int(m.group(1)), text)
-    text = patterns.ANSI_ESCAPE.sub('', text)
-    text = patterns.CONTROL_CHARS.sub('', text)
-    return text
-
-
-_OPTION_EXTRACTORS = {
-    'gemini': lambda text: _extract_options_gemini(text),
-    'codex': lambda text: _extract_options_codex(text),
-}
-
-
-def _extract_options(text: str, cli_type: str = 'claude') -> tuple:
-    """從清理後的文字提取標題和選項行，根據 CLI 類型分派邏輯
-
-    Returns:
-        (title, options) — title 為提問文字，options 為 [(num, label), ...]
-    """
-    return _OPTION_EXTRACTORS.get(cli_type, _extract_options_claude)(text)
-
-
-def _is_border_line(line: str) -> bool:
-    """判斷是否為分隔線（╌ 或 ─ 連續 10 個以上）"""
-    stripped = line.strip()
-    return ('╌' in stripped or
-            (stripped.startswith('─') and len(stripped) > 10))
-
-
-def _extract_options_claude(text: str) -> tuple:
-    """Claude Code 格式：分隔線後 + ❯ 標記選項"""
-    lines = text.split('\n')
-
-    # 找最後一條分隔線（╌ 或 ─），只在其後搜尋選項
-    last_border_idx = -1
-    for i in range(len(lines) - 1, -1, -1):
-        if _is_border_line(lines[i]):
-            last_border_idx = i
-            break
-
-    # 沒有分隔線 → 退回用 ❯ 標記直接搜尋（從尾部往前找 ❯ 行）
-    if last_border_idx < 0:
-        # 從尾部找 ❯ 所在行，往前擴展選項區塊
-        marker_idx = -1
-        for i in range(len(lines) - 1, -1, -1):
-            if '❯' in lines[i]:
-                marker_idx = i
-                break
-        if marker_idx < 0:
-            return "", []
-        search_start = max(0, marker_idx - 10)
-    else:
-        search_start = last_border_idx + 1
-
-    options = []
-    first_option_idx = None
-    has_marker = False
-
-    for i in range(search_start, len(lines)):
-        line_stripped = lines[i].strip()
-        if not line_stripped:
-            continue
-        match = patterns.CONFIRMATION_OPTION.match(line_stripped)
-        if match:
-            num, label = match.group(1), match.group(2).strip()
-            if len(num) <= 2:
-                if first_option_idx is None:
-                    first_option_idx = i
-                if '❯' in lines[i]:
-                    has_marker = True
-                options.append((num, label))
-
-    # 沒有 ❯ 標記的編號列表不是互動選項
-    if not has_marker:
-        return "", []
-
-    # 標題：分隔線後、選項前的文字
-    title = ""
-    if first_option_idx is not None:
-        title_lines = []
-        border_count = 0
-        for i in range(first_option_idx - 1, max(first_option_idx - 60, -1), -1):
-            if i < 0:
-                break
-            line = lines[i].strip()
-            if not line:
-                continue
-            if _is_border_line(lines[i]):
-                break
-            title_lines.insert(0, line)
-        title = '\n'.join(title_lines)
-        if len(title) > 3000:
-            title = title[-3000:]
-
-    return title, options
-
-
-def _extract_options_gemini(text: str) -> tuple:
-    """Gemini CLI 格式：╭╰ 框框包裹，│ 邊線，● 標記當前選項"""
-    lines = text.split('\n')
-
-    # 找最後一個 ╰ 結束行（框框底部）
-    box_end = -1
-    for i in range(len(lines) - 1, -1, -1):
-        if '╰' in lines[i]:
-            box_end = i
-            break
-
-    if box_end < 0:
-        return "", []
-
-    # 找對應的 ╭ 開始行
-    box_start = -1
-    for i in range(box_end - 1, -1, -1):
-        if '╭' in lines[i]:
-            box_start = i
-            break
-
-    if box_start < 0:
-        return "", []
-
-    # 在框框內搜尋選項（移除 │ 邊線後匹配）
-    options = []
-    title_lines = []
-    first_option_idx = None
-
-    for i in range(box_start + 1, box_end):
-        line = lines[i]
-        # 移除 │ 邊線
-        cleaned_line = line.replace('│', '').strip()
-        if not cleaned_line:
-            continue
-
-        match = patterns.GEMINI_OPTION.match(cleaned_line)
-        if match:
-            num, label = match.group(1), match.group(2).strip()
-            if len(num) <= 2:
-                if first_option_idx is None:
-                    first_option_idx = i
-                options.append((num, label))
-        elif first_option_idx is None:
-            # 選項之前的內容作為標題
-            title_lines.append(cleaned_line)
-
-    title = '\n'.join(title_lines)
-    if len(title) > 3000:
-        title = title[-3000:]
-
-    return title, options
-
-
-def _extract_options_codex(text: str) -> tuple:
-    """Codex CLI 格式：› 標記當前選項，純編號列表
-
-    Codex 使用 ink/React TUI，需透過 tmux capture-pane 取得渲染後文字。
-    格式範例：
-        › 1. Yes, proceed (y)
-          2. Yes, and don't ask again for ... (p)
-          3. No, and tell Codex what to do differently (esc)
-    """
-    lines = text.split('\n')
-
-    # Codex 選項模式：可選的 › 前綴 + 編號
-    codex_option_re = re.compile(r'^\s*[›]?\s*(\d+)\.\s*(.+)')
-
-    # 從尾部往前掃描找到選項區塊
-    options = []
-    first_option_idx = None
-    last_option_idx = None
-    has_marker = False  # 至少一個選項要有 › 標記
-
-    for i in range(len(lines) - 1, -1, -1):
-        line = lines[i].strip()
-        if not line:
-            continue
-        match = codex_option_re.match(line)
-        if match:
-            num, label = match.group(1), match.group(2).strip()
-            if len(num) <= 2:
-                if last_option_idx is None:
-                    last_option_idx = i
-                first_option_idx = i
-                if '›' in lines[i]:
-                    has_marker = True
-                options.insert(0, (num, label))
-        elif last_option_idx is not None:
-            # 遇到非選項行且已找到選項，選項區塊結束
-            break
-
-    # 沒有 › 標記的編號列表不是互動選項
-    if not options or not has_marker:
-        return "", []
-
-    # 標題：選項區塊之前的內容（往前最多 30 行）
-    title_lines = []
-    for i in range(first_option_idx - 1, max(first_option_idx - 30, -1), -1):
-        if i < 0:
-            break
-        line = lines[i].strip()
-        if not line:
-            continue
-        # 遇到分隔線或 › 提示行（非選項的輸入行）停止
-        if line.startswith('─') and len(line) > 10:
-            break
-        if line.startswith('›') and not codex_option_re.match(line):
-            break
-        title_lines.insert(0, line)
-
-    title = '\n'.join(title_lines)
-    if len(title) > 3000:
-        title = title[-3000:]
-
-    return title, options
 
 
 def interaction_polling_worker():
@@ -977,6 +753,7 @@ def interaction_polling_worker():
 
                 # Codex ink/React TUI 用游標定位重繪，日誌無法解析
                 # 改用 tmux capture-pane 取得渲染後畫面
+                file_state = None
                 if cli_type == 'codex':
                     bridge = bot_state.session_manager.get_bridge(name)
                     if not bridge or not bridge.session_exists():
@@ -984,19 +761,26 @@ def interaction_polling_worker():
                     cleaned = _capture_tmux_pane(bridge.session_name)
                 else:
                     log_file = config.log_file
-                    if not os.path.exists(log_file):
+
+                    # 檔案未變化時跳過重讀重解析，將 idle session 的 I/O 降到近乎零
+                    try:
+                        stat_info = os.stat(log_file)
+                    except OSError:
+                        continue
+                    file_state = (stat_info.st_size, stat_info.st_mtime)
+                    if _poll_file_state.get(name) == file_state:
                         continue
 
-                    # 讀取日誌尾部（最後 5000 字元，足以包含選項區塊）
+                    # 讀取日誌尾部（足以包含選項區塊）
                     try:
-                        file_size = os.path.getsize(log_file)
                         with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
-                            f.seek(max(0, file_size - 5000))
+                            f.seek(max(0, stat_info.st_size - app_config.tmux.LOG_TAIL_BYTES))
                             new_content = f.read()
                     except Exception:
                         continue
 
                     if not new_content:
+                        _poll_file_state[name] = file_state
                         continue
 
                     # 清理 ANSI
@@ -1004,9 +788,13 @@ def interaction_polling_worker():
                 title, options = _extract_options(cleaned, cli_type)
 
                 if len(options) < 2:
+                    if file_state is not None:
+                        _poll_file_state[name] = file_state
                     continue
 
                 # 防重複：冷卻時間 + hash（加鎖保護）
+                # hash 納入 session 與標題，避免不同 session／不同提問的相同選項組被誤判重複；
+                # 加 TTL 讓同一提問在過期後可重新推送（否則固定文字的選項永久被抑制）
                 now = time.time()
                 with _poll_lock:
                     last_sent = _poll_last_sent.get(name, 0)
@@ -1014,29 +802,35 @@ def interaction_polling_worker():
                         continue
 
                     options_text = '|'.join(f"{n}.{l}" for n, l in options)
-                    options_hash = hashlib.md5(options_text.encode()).hexdigest()
-                    if options_hash in _poll_sent_hashes:
+                    options_hash = hashlib.md5(
+                        f"{name}|{title}|{options_text}".encode()
+                    ).hexdigest()
+                    sent_at = _poll_sent_hashes.get(options_hash)
+                    if sent_at is not None and now - float(sent_at) < _POLL_HASH_TTL:
                         continue
                     # 限界：超過上限時刪除最舊的一半（dict 保持插入順序）
                     if len(_poll_sent_hashes) >= _POLL_HASH_MAX_SIZE:
                         keys = list(_poll_sent_hashes.keys())
                         for k in keys[:len(keys) // 2]:
                             del _poll_sent_hashes[k]
-                    _poll_sent_hashes[options_hash] = True
+                    _poll_sent_hashes[options_hash] = now
                     _poll_last_sent[name] = now
+
+                if file_state is not None:
+                    _poll_file_state[name] = file_state
 
                 # 組合標題（Telegram API 限制 4096 字元）
                 header_parts = [f"📋 [#{name}]"]
                 if title:
                     header_parts.append(title)
                 header = '\n'.join(header_parts)
-                if len(header) > 4000:
-                    header = header[:4000] + "\n\n⋯"
+                max_header = app_config.telegram.MAX_HEADER_LENGTH
+                if len(header) > max_header:
+                    header = header[:max_header] + "\n\n⋯"
 
                 # 組合 InlineKeyboard 並用 requests 直接呼叫 Telegram API
                 # （輪詢執行緒無法使用 async，故用同步 requests）
                 try:
-                    import requests as req
                     inline_keyboard = []
                     for num, label in options:
                         is_text_input = any(kw.lower() in label.lower() for kw in TEXT_INPUT_KEYWORDS)
@@ -1049,13 +843,13 @@ def interaction_polling_worker():
                         "reply_markup": json.dumps({"inline_keyboard": inline_keyboard})
                     }
                     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-                    resp = req.post(url, json=payload, timeout=10)
+                    resp = requests.post(url, json=payload, timeout=app_config.telegram.API_TIMEOUT)
                     if resp.ok:
                         logger.info(f"Sent interaction buttons for #{name}")
                     else:
                         logger.warning(f"Failed to send buttons: {resp.text}")
                 except Exception as e:
-                    logger.warning(f"Failed to send interaction buttons: {e}")
+                    logger.warning(f"Failed to send interaction buttons: {redact_token(e)}")
 
         except Exception as e:
             logger.error(f"Interaction polling error: {e}")

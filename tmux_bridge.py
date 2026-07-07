@@ -41,7 +41,8 @@ class TmuxBridge:
         """檢查 tmux 是否已安裝"""
         try:
             return subprocess.run(
-                ['which', 'tmux'], capture_output=True, text=True
+                ['which', 'tmux'], capture_output=True, text=True,
+                timeout=config.tmux.TMUX_CMD_TIMEOUT
             ).returncode == 0
         except Exception:
             return False
@@ -51,7 +52,8 @@ class TmuxBridge:
         try:
             return subprocess.run(
                 ['tmux', 'has-session', '-t', self.session_name],
-                capture_output=True, text=True
+                capture_output=True, text=True,
+                timeout=config.tmux.TMUX_CMD_TIMEOUT
             ).returncode == 0
         except Exception:
             return False
@@ -110,7 +112,8 @@ class TmuxBridge:
             if work_dir:
                 cmd.extend(['-c', work_dir])
 
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    timeout=config.tmux.TMUX_CMD_TIMEOUT)
             if result.returncode != 0:
                 logger.error(t('tmux.create_failed', error=result.stderr))
                 return False
@@ -119,7 +122,7 @@ class TmuxBridge:
             result = subprocess.run([
                 'tmux', 'pipe-pane', '-t', self.session_name,
                 '-o', f'cat >> {shlex.quote(self.log_file)}'
-            ], capture_output=True, text=True)
+            ], capture_output=True, text=True, timeout=config.tmux.TMUX_CMD_TIMEOUT)
 
             if result.returncode != 0:
                 logger.warning(t('tmux.log_start_failed', error=result.stderr))
@@ -148,28 +151,8 @@ class TmuxBridge:
             return False
 
     def _run_tmux(self, args: list, error_msg: str) -> bool:
-        """
-        執行 tmux 命令的通用輔助方法
-
-        Args:
-            args: tmux 命令參數列表
-            error_msg: 失敗時的日誌訊息前綴
-
-        Returns:
-            bool: 是否成功
-        """
-        try:
-            result = subprocess.run(
-                ['tmux'] + args,
-                capture_output=True, text=True
-            )
-            if result.returncode != 0:
-                logger.error(f"{error_msg}: {result.stderr}")
-                return False
-            return True
-        except Exception as e:
-            logger.error(f"{error_msg}: {e}")
-            return False
+        """執行 tmux 命令的通用輔助方法"""
+        return _run_tmux_command(args, error_msg)
 
     def send_command(self, command: str) -> bool:
         """發送命令到 tmux 會話（自動按 Enter）"""
@@ -177,32 +160,7 @@ class TmuxBridge:
             logger.error(t('tmux.session_not_exists', name=self.session_name))
             return False
 
-        # 使用 -l 發送字面文字，避免特殊字元被解釋
-        if not self._run_tmux(
-            ['send-keys', '-t', self.session_name, '-l', command],
-            t('tmux.send_cmd_failed')
-        ):
-            return False
-
-        # Codex ink/React TUI 需要延遲，否則 Enter 可能被當成輸入框的換行
-        if self.cli_provider.pre_enter_delay > 0:
-            time.sleep(self.cli_provider.pre_enter_delay)
-
-        if not self._run_tmux(
-            ['send-keys', '-t', self.session_name, 'Enter'],
-            t('tmux.send_enter_failed')
-        ):
-            return False
-
-        # Gemini CLI 的輸入框需要額外一次 Enter 才能送出
-        if self.cli_provider.extra_enter:
-            if not self._run_tmux(
-                ['send-keys', '-t', self.session_name, 'Enter'],
-                t('tmux.send_extra_enter_failed')
-            ):
-                return False
-
-        return True
+        return _send_message_keys(self.session_name, self.cli_provider, command)
 
     def send_text(self, text: str) -> bool:
         """發送文字到 tmux 會話（不自動按 Enter）"""
@@ -324,6 +282,66 @@ class TmuxBridge:
         }
 
 
+def _run_tmux_command(args: list, error_msg: str) -> bool:
+    """執行 tmux 命令（含逾時保護），失敗時記錄日誌"""
+    try:
+        result = subprocess.run(
+            ['tmux'] + args,
+            capture_output=True, text=True,
+            timeout=config.tmux.TMUX_CMD_TIMEOUT
+        )
+        if result.returncode != 0:
+            logger.error(f"{error_msg}: {result.stderr}")
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"{error_msg}: {e}")
+        return False
+
+
+def _send_message_keys(tmux_session: str, provider: CliProvider, message: str) -> bool:
+    """共用的訊息送出邏輯（所有發送路徑統一走這裡）
+
+    超長訊息使用 load-buffer + paste-buffer 避免 send-keys 截斷；
+    之後依 provider 特性送出 Enter（pre_enter_delay / extra_enter）。
+    """
+    error_msg = f"tmux send failed for {tmux_session}"
+
+    if len(message) > config.tmux.PASTE_BUFFER_THRESHOLD:
+        import tempfile
+        fd, tmp_path = tempfile.mkstemp(suffix='.txt')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as tmp:
+                tmp.write(message)
+            if not _run_tmux_command(['load-buffer', tmp_path], error_msg):
+                return False
+            if not _run_tmux_command(['paste-buffer', '-t', tmux_session], error_msg):
+                return False
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    else:
+        # 使用 -l 發送字面文字，避免特殊字元被解釋
+        if not _run_tmux_command(['send-keys', '-t', tmux_session, '-l', message], error_msg):
+            return False
+
+    # Codex ink/React TUI 需要延遲，否則 Enter 可能被當成輸入框的換行
+    if provider.pre_enter_delay > 0:
+        time.sleep(provider.pre_enter_delay)
+
+    if not _run_tmux_command(['send-keys', '-t', tmux_session, 'Enter'], error_msg):
+        return False
+
+    # Gemini CLI 的輸入框需要額外一次 Enter 才能送出
+    if provider.extra_enter:
+        if not _run_tmux_command(['send-keys', '-t', tmux_session, 'Enter'], error_msg):
+            return False
+
+    return True
+
+
 def send_keys_to_session(tmux_session: str, cli_type: str, message: str) -> bool:
     """
     模組級輔助函式：透過 tmux send-keys 發送訊息到指定會話。
@@ -337,62 +355,14 @@ def send_keys_to_session(tmux_session: str, cli_type: str, message: str) -> bool
     Returns:
         bool: 是否成功
     """
-    from cli_provider import ClaudeProvider, GeminiProvider, CodexProvider
+    from cli_provider import create_provider
 
-    # 透過 cli_type 取得對應 provider 的行為參數
-    _providers = {
-        'claude': ClaudeProvider,
-        'gemini': GeminiProvider,
-        'codex': CodexProvider,
-    }
-    provider_cls = _providers.get(cli_type, ClaudeProvider)
-    provider = provider_cls()
+    try:
+        provider = create_provider(cli_type)
+    except ValueError:
+        provider = ClaudeProvider()
 
-    def _run(args: list) -> bool:
-        try:
-            result = subprocess.run(['tmux'] + args, capture_output=True, text=True)
-            if result.returncode != 0:
-                logger.error(f"tmux {args[0]} failed for {tmux_session}: {result.stderr}")
-                return False
-            return True
-        except Exception as e:
-            logger.error(f"tmux {args[0]} error for {tmux_session}: {e}")
-            return False
-
-    # 超長訊息使用 load-buffer + paste-buffer 避免 send-keys 截斷
-    if len(message) > 2000:
-        import tempfile
-        fd, tmp_path = tempfile.mkstemp(suffix='.txt')
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as tmp:
-                tmp.write(message)
-            if not _run(['load-buffer', tmp_path]):
-                return False
-            if not _run(['paste-buffer', '-t', tmux_session]):
-                return False
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-    else:
-        if not _run(['send-keys', '-t', tmux_session, '-l', message]):
-            return False
-
-    # pre-enter delay（Codex ink/React TUI 需要）
-    if provider.pre_enter_delay > 0:
-        time.sleep(provider.pre_enter_delay)
-
-    # 發送 Enter
-    if not _run(['send-keys', '-t', tmux_session, 'Enter']):
-        return False
-
-    # Gemini 需要額外 Enter
-    if provider.extra_enter:
-        if not _run(['send-keys', '-t', tmux_session, 'Enter']):
-            return False
-
-    return True
+    return _send_message_keys(tmux_session, provider, message)
 
 
 if __name__ == '__main__':

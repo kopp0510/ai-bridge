@@ -6,11 +6,15 @@ CLI 提供者抽象層
 
 import json
 import logging
+import re
 import shlex
+import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import Protocol, Optional
 
+from config import config as app_config
 from i18n import t
 
 logger = logging.getLogger(__name__)
@@ -64,21 +68,50 @@ class CliProvider(Protocol):
 
 # === 共用 helper ===
 
+# bridge 建立的 hook entry 識別標記（_build_hook_command 產生的 command 一定含此前綴）
+_BRIDGE_HOOK_MARKER = 'TELEGRAM_SESSION_NAME='
+
+
+def _backup_file(path: Path) -> None:
+    """修改使用者全域設定檔前備份一份 .bak"""
+    try:
+        if path.exists():
+            shutil.copy2(path, Path(str(path) + '.bak'))
+    except OSError as e:
+        logger.warning(f"Backup failed for {path}: {e}")
+
+
+def _is_bridge_hook_entry(entry) -> bool:
+    """判斷 hook entry 是否由本 bridge 建立（不動使用者自己的 hooks）"""
+    if not isinstance(entry, dict):
+        return False
+    return any(
+        _BRIDGE_HOOK_MARKER in h.get('command', '')
+        for h in entry.get('hooks', []) if isinstance(h, dict)
+    )
+
+
 def _remove_hook_key(settings_file: Path, hook_key: str, log_label: str) -> bool:
-    """從設定檔移除指定 hook key（保留其他設定）"""
+    """從設定檔移除 bridge 建立的 hook entry（保留使用者自己的 hooks 與其他設定）"""
     if not settings_file.exists():
         return True
 
     with open(settings_file, 'r', encoding='utf-8') as f:
         settings = json.load(f)
 
-    if 'hooks' in settings and hook_key in settings['hooks']:
-        del settings['hooks'][hook_key]
-        if not settings['hooks']:
-            del settings['hooks']
+    entries = settings.get('hooks', {}).get(hook_key) if isinstance(settings.get('hooks'), dict) else None
+    if isinstance(entries, list):
+        remaining = [e for e in entries if not _is_bridge_hook_entry(e)]
+        if len(remaining) != len(entries):
+            if remaining:
+                settings['hooks'][hook_key] = remaining
+            else:
+                del settings['hooks'][hook_key]
+                if not settings['hooks']:
+                    del settings['hooks']
 
-        with open(settings_file, 'w', encoding='utf-8') as f:
-            json.dump(settings, f, indent=2, ensure_ascii=False)
+            with open(settings_file, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2, ensure_ascii=False)
 
     logger.info(t(log_label, name=str(settings_file.parent.parent)))
     return True
@@ -87,6 +120,9 @@ def _remove_hook_key(settings_file: Path, hook_key: str, log_label: str) -> bool
 def _configure_hooks_json(work_dir: str, config_subpath: str, hook_key: str,
                           hook_data: list, log_label: str) -> bool:
     """共用的 JSON hook 配置邏輯（讀取 → 合併 → 寫回）
+
+    合併而非覆蓋：保留使用者自己的同名 hooks，只取代 bridge 先前建立的 entry。
+    既有設定檔無法解析時中止配置，避免以空設定覆寫使用者檔案。
 
     Args:
         work_dir: 專案目錄
@@ -104,12 +140,18 @@ def _configure_hooks_json(work_dir: str, config_subpath: str, hook_key: str,
             with open(settings_file, 'r', encoding='utf-8') as f:
                 existing_settings = json.load(f)
         except Exception as e:
-            logger.warning(t('provider.hooks_read_failed', error=e))
+            logger.error(t('provider.hooks_read_failed', error=e))
+            return False
 
-    if 'hooks' not in existing_settings:
+    if not isinstance(existing_settings.get('hooks'), dict):
         existing_settings['hooks'] = {}
 
-    existing_settings['hooks'][hook_key] = hook_data
+    entries = existing_settings['hooks'].get(hook_key)
+    if not isinstance(entries, list):
+        entries = []
+    entries = [e for e in entries if not _is_bridge_hook_entry(e)]
+    entries.extend(hook_data)
+    existing_settings['hooks'][hook_key] = entries
 
     with open(settings_file, 'w', encoding='utf-8') as f:
         json.dump(existing_settings, f, indent=2, ensure_ascii=False)
@@ -170,7 +212,8 @@ class BaseProvider:
     def is_installed(self) -> bool:
         try:
             return subprocess.run(
-                ['which', self._command], capture_output=True, text=True
+                ['which', self._command], capture_output=True, text=True,
+                timeout=app_config.tmux.TMUX_CMD_TIMEOUT
             ).returncode == 0
         except Exception:
             return False
@@ -191,10 +234,11 @@ class BaseProvider:
             if self._hook_needs_matcher:
                 hook_entry["matcher"] = "*"
 
-            _configure_hooks_json(
+            if not _configure_hooks_json(
                 work_dir, self._config_subpath, self._hook_key,
                 [hook_entry], f'provider.hooks_configured_{self._name}'
-            )
+            ):
+                return False
 
             logger.info(t(f'provider.hooks_configured_{self._name}', name=session_name))
             self._post_configure_hooks(work_dir)
@@ -258,6 +302,7 @@ class GeminiProvider(BaseProvider):
             if trusted.get(abs_path) == "TRUST_FOLDER":
                 return
 
+            _backup_file(trusted_file)
             trusted[abs_path] = "TRUST_FOLDER"
             with open(trusted_file, 'w', encoding='utf-8') as f:
                 json.dump(trusted, f, indent=2, ensure_ascii=False)
@@ -280,26 +325,45 @@ class CodexProvider(BaseProvider):
         self._enable_hooks_feature_flag()
         self._trust_folder(work_dir)
 
-    @staticmethod
-    def _enable_hooks_feature_flag() -> None:
+    # 精確匹配 codex_hooks 賦值行（不會誤命中註解或含此字串的其他行）
+    _HOOK_FLAG_LINE = re.compile(r'^\s*codex_hooks\s*=')
+
+    @classmethod
+    def _enable_hooks_feature_flag(cls) -> None:
         """在 ~/.codex/config.toml 中啟用 codex_hooks = true"""
         try:
             config_dir = Path.home() / '.codex'
             config_dir.mkdir(exist_ok=True)
             config_file = config_dir / 'config.toml'
 
-            lines = []
+            content = ''
             if config_file.exists():
                 with open(config_file, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
+                    content = f.read()
 
+            # 先用 TOML parser 確認現況：已啟用就不動使用者檔案；
+            # 檔案無法解析時中止，避免行操作把損壞的檔案改得更糟
+            try:
+                parsed = tomllib.loads(content)
+                if parsed.get('features', {}).get('codex_hooks') is True:
+                    return
+            except tomllib.TOMLDecodeError as e:
+                logger.warning(t('provider.hooks_feature_enable_failed', error=e))
+                return
+
+            _backup_file(config_file)
+
+            lines = content.splitlines(keepends=True)
             feature_section_idx = None
             hook_line_idx = None
+            current_section = None
             for i, line in enumerate(lines):
                 stripped = line.strip()
-                if stripped == '[features]':
-                    feature_section_idx = i
-                if 'codex_hooks' in stripped:
+                if stripped.startswith('['):
+                    current_section = stripped
+                    if stripped == '[features]':
+                        feature_section_idx = i
+                elif cls._HOOK_FLAG_LINE.match(line) and current_section == '[features]':
                     hook_line_idx = i
 
             if hook_line_idx is not None:
@@ -333,9 +397,22 @@ class CodexProvider(BaseProvider):
                 with open(config_file, 'r', encoding='utf-8') as f:
                     content = f.read()
 
-            section_header = f'[projects."{abs_path}"]'
-            if section_header in content:
+            # 用 TOML parser 確認現況（比子字串比對可靠）；無法解析時中止
+            try:
+                parsed = tomllib.loads(content)
+                projects = parsed.get('projects', {})
+                if isinstance(projects.get(abs_path), dict) and \
+                        projects[abs_path].get('trust_level') == 'trusted':
+                    return
+            except tomllib.TOMLDecodeError as e:
+                logger.warning(t('provider.folder_trust_failed', error=e))
                 return
+
+            _backup_file(config_file)
+
+            # TOML basic string 跳脫（路徑含 " 或 \ 時仍產生合法 TOML）
+            escaped = abs_path.replace('\\', '\\\\').replace('"', '\\"')
+            section_header = f'[projects."{escaped}"]'
 
             if content and not content.endswith('\n'):
                 content += '\n'

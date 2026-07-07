@@ -18,9 +18,11 @@ load_language() {
     local lang="zh-TW"
     if [ -f "$SCRIPT_DIR/.env" ]; then
         local env_lang
-        # 暫時關閉 pipefail，避免 grep 找不到 LANGUAGE 時退出
+        # 暫時關閉 pipefail，避免 grep 找不到時退出
+        # 優先讀 AI_BRIDGE_LANGUAGE，舊鍵 LANGUAGE 向後相容
         set +o pipefail
-        env_lang=$(grep -E '^LANGUAGE=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+        env_lang=$(grep -E '^AI_BRIDGE_LANGUAGE=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+        [ -z "$env_lang" ] && env_lang=$(grep -E '^LANGUAGE=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
         set -o pipefail
         [ -n "$env_lang" ] && lang="$env_lang"
     fi
@@ -85,6 +87,14 @@ do_validate() {
     if [ -f "$SCRIPT_DIR/.env" ]; then
         info "$MSG_ENV_EXISTS"
 
+        # 收緊 .env 權限（含 Bot Token，避免同機其他使用者可讀）
+        local env_perms
+        env_perms=$(stat -f "%Lp" "$SCRIPT_DIR/.env" 2>/dev/null || stat -c "%a" "$SCRIPT_DIR/.env" 2>/dev/null || echo "")
+        if [ -n "$env_perms" ] && [ "$env_perms" != "600" ]; then
+            chmod 600 "$SCRIPT_DIR/.env" 2>/dev/null || true
+            warn "$MSG_ENV_PERMS_TIGHTENED"
+        fi
+
         # 檢查 TELEGRAM_BOT_TOKEN
         local token
         set +o pipefail
@@ -97,13 +107,30 @@ do_validate() {
             info "$MSG_TOKEN_SET"
         fi
 
-        # 檢查 LANGUAGE
+        # 檢查 ALLOWED_USER_IDS（必填，bot 啟動時空白會直接退出）
+        local user_ids
+        set +o pipefail
+        user_ids=$(grep -E '^ALLOWED_USER_IDS=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+        set -o pipefail
+        if [ -z "$user_ids" ]; then
+            error "$MSG_USER_IDS_NOT_SET"
+            errors=$((errors + 1))
+        elif ! echo "$user_ids" | grep -Eq '^[0-9]+( *, *[0-9]+)*$'; then
+            warn "$(printf "$MSG_USER_IDS_INVALID" "$user_ids")"
+        else
+            info "$MSG_USER_IDS_SET"
+        fi
+
+        # 檢查語言設定（AI_BRIDGE_LANGUAGE 優先，舊鍵 LANGUAGE 向後相容）
         set +o pipefail
         local lang_val
-        lang_val=$(grep -E '^LANGUAGE=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+        lang_val=$(grep -E '^AI_BRIDGE_LANGUAGE=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
+        [ -z "$lang_val" ] && lang_val=$(grep -E '^LANGUAGE=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'")
         set -o pipefail
         if [ -z "$lang_val" ]; then
             warn "$MSG_LANGUAGE_NOT_SET"
+        elif [ "$lang_val" != "zh-TW" ] && [ "$lang_val" != "en" ]; then
+            warn "$(printf "$MSG_LANGUAGE_INVALID" "$lang_val")"
         else
             info "$(printf "$MSG_LANGUAGE_SET" "$lang_val")"
         fi
@@ -194,8 +221,9 @@ except Exception:
         if command -v "$cli_type" &>/dev/null; then
             info "$(printf "$MSG_CLI_INSTALLED" "$cli_type")"
             # 版本檢查確認 CLI 可正常執行
-            cli_version=$("$cli_type" --version 2>/dev/null)
-            if [ $? -eq 0 ] && [ -n "$cli_version" ]; then
+            # || true 避免直接執行 ./bridge.sh validate 時 errexit 導致腳本靜默中止
+            cli_version=$("$cli_type" --version 2>/dev/null) || true
+            if [ -n "$cli_version" ]; then
                 info "$(printf "$MSG_CLI_VERSION" "$cli_type" "$cli_version")"
             else
                 warn "$(printf "$MSG_CLI_NO_VERSION" "$cli_type")"
@@ -297,14 +325,19 @@ do_start() {
     chmod +x "$SCRIPT_DIR/notify_telegram.sh" 2>/dev/null || true
     chmod +x "$SCRIPT_DIR/send_telegram_notification.py" 2>/dev/null || true
 
+    # 收緊 .env 權限（含 Bot Token）
+    chmod 600 "$SCRIPT_DIR/.env" 2>/dev/null || true
+
     # 載入環境變數
     set -a
     source "$SCRIPT_DIR/.env"
     set +a
 
-    # 後台啟動 bot
+    # 後台啟動 bot（umask 077 讓 bot.log 與 bot 建立的檔案僅擁有者可讀）
     step "$MSG_STEP_START_BOT"
     cd "$SCRIPT_DIR"
+    umask 077
+    touch "$BOT_LOG" && chmod 600 "$BOT_LOG" 2>/dev/null || true
     nohup "$VENV_DIR/bin/python3" telegram_bot_multi.py >> "$BOT_LOG" 2>&1 &
     local pid=$!
     echo "$pid" > "$PID_FILE"
@@ -325,15 +358,30 @@ do_start() {
     fi
 }
 
+# === 清理執行期殘留檔案（日誌、chain、status）===
+cleanup_runtime_files() {
+    # 清理日誌
+    step "$MSG_STEP_CLEANUP_LOGS"
+    find "$LOG_DIR" -name "*_*.log" -delete 2>/dev/null || true
+    find "$LOG_DIR" -name "hook_debug_*.log" -delete 2>/dev/null || true
+
+    # 清理 chain 和 status 殘留檔案（避免重啟後意外觸發轉發）
+    rm -f "${HOME}/.ai_bridge/chains/"*.json 2>/dev/null || true
+    rm -f "${HOME}/.ai_bridge/chains/"*.done 2>/dev/null || true
+    rm -f "${HOME}/.ai_bridge/chains/"*.claimed.* 2>/dev/null || true
+    rm -f "${HOME}/.ai_bridge/status/"*.busy 2>/dev/null || true
+}
+
 # === 停止 ===
 do_stop() {
     if ! is_running; then
         warn "$MSG_NOT_RUNNING"
         # 清理可能殘留的 PID 檔案
         rm -f "$PID_FILE"
-        # 仍然嘗試清理 hooks 和 tmux 會話
+        # 仍然清理 hooks、tmux 會話與殘留檔案（bot 崩潰後 chain 檔可能觸發非預期轉發）
         cleanup_hooks
         cleanup_tmux
+        cleanup_runtime_files
         return 0
     fi
 
@@ -342,8 +390,8 @@ do_stop() {
 
     step "$(printf "$MSG_STEP_STOP" "$pid")"
 
-    # 發送 SIGTERM
-    kill "$pid" 2>/dev/null
+    # 發送 SIGTERM（|| true 避免進程剛好退出時 errexit 中斷後續清理）
+    kill "$pid" 2>/dev/null || true
 
     # 等待進程退出（最多 10 秒）
     local count=0
@@ -355,7 +403,7 @@ do_stop() {
     # 如果還沒退出，強制終止
     if kill -0 "$pid" 2>/dev/null; then
         warn "$MSG_FORCE_KILL"
-        kill -9 "$pid" 2>/dev/null
+        kill -9 "$pid" 2>/dev/null || true
         sleep 1
     fi
 
@@ -368,16 +416,8 @@ do_stop() {
     # 清理 tmux 會話
     cleanup_tmux
 
-    # 清理日誌
-    step "$MSG_STEP_CLEANUP_LOGS"
-    find "$LOG_DIR" -name "*_*.log" -delete 2>/dev/null
-    find "$LOG_DIR" -name "hook_debug_*.log" -delete 2>/dev/null
-
-    # 清理 chain 和 status 殘留檔案（避免重啟後意外觸發轉發）
-    rm -f "${HOME}/.ai_bridge/chains/"*.json 2>/dev/null
-    rm -f "${HOME}/.ai_bridge/chains/"*.done 2>/dev/null
-    rm -f "${HOME}/.ai_bridge/chains/"*.claimed.* 2>/dev/null
-    rm -f "${HOME}/.ai_bridge/status/"*.busy 2>/dev/null
+    # 清理日誌與 chain/status 殘留檔案
+    cleanup_runtime_files
 
     info "$MSG_BOT_STOPPED"
 }
@@ -443,13 +483,27 @@ for s in (c.get('sessions', []) if c else []):
     try:
         with open(sf, 'r') as f:
             settings = json.load(f)
-        if 'hooks' in settings and hook_key in settings['hooks']:
-            del settings['hooks'][hook_key]
-            if not settings['hooks']:
-                del settings['hooks']
-            with open(sf, 'w') as f:
-                json.dump(settings, f, indent=2, ensure_ascii=False)
-            print(f'  removed {hook_key} hook: {path}')
+        # 只移除 bridge 建立的 entry（command 含 TELEGRAM_SESSION_NAME=），
+        # 保留使用者自己的同名 hooks
+        hooks = settings.get('hooks')
+        entries = hooks.get(hook_key) if isinstance(hooks, dict) else None
+        if isinstance(entries, list):
+            remaining = [
+                e for e in entries
+                if not (isinstance(e, dict) and any(
+                    'TELEGRAM_SESSION_NAME=' in h.get('command', '')
+                    for h in e.get('hooks', []) if isinstance(h, dict)))
+            ]
+            if len(remaining) != len(entries):
+                if remaining:
+                    settings['hooks'][hook_key] = remaining
+                else:
+                    del settings['hooks'][hook_key]
+                    if not settings['hooks']:
+                        del settings['hooks']
+                with open(sf, 'w') as f:
+                    json.dump(settings, f, indent=2, ensure_ascii=False)
+                print(f'  removed {hook_key} hook: {path}')
     except Exception as e:
         print(f'  warning: {e}')
 " 2>/dev/null

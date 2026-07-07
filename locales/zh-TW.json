@@ -97,6 +97,7 @@
     "reload_config_error": "❌ 重載配置失敗: {error}",
     "config_format_error": "配置文件格式錯誤: {file}",
     "queue_error": "處理佇列訊息時錯誤: {error}",
+    "send_failed": "訊息發送到 #{session} 失敗（tmux 會話可能已停止），請用 /status 檢查或 /restart #{session} 重啟",
     "queue_processing": "[#{session}] 處理訊息: {preview}...",
     "log_truncated": "日誌已截斷: {name}"
   },

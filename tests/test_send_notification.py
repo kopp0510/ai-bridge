@@ -45,8 +45,8 @@ class TestSendTelegramNotification:
 
     @patch('send_telegram_notification.requests.post')
     def test_send_to_chat_retry_on_failure(self, mock_post):
-        """測試失敗重試"""
-        # 前兩次失敗，第三次成功
+        """測試失敗重試（MAX_RETRIES=2，重試預算須低於 hook timeout）"""
+        # 第一次失敗，第二次成功
         mock_fail = MagicMock()
         mock_fail.ok = False
         mock_fail.json.return_value = {'error_code': 500, 'description': 'Server Error'}
@@ -56,11 +56,11 @@ class TestSendTelegramNotification:
         mock_success = MagicMock()
         mock_success.ok = True
 
-        mock_post.side_effect = [mock_fail, mock_fail, mock_success]
+        mock_post.side_effect = [mock_fail, mock_success]
 
         result = send_to_chat("token", "123456", "Hello")
         assert result is True
-        assert mock_post.call_count == 3
+        assert mock_post.call_count == 2
 
     @patch('send_telegram_notification.requests.post')
     def test_send_to_chat_non_retryable_error(self, mock_post):

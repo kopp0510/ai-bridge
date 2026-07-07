@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 國際化（i18n）模組
-透過 .env 的 LANGUAGE 設定選擇語言
+透過 .env 的 AI_BRIDGE_LANGUAGE 設定選擇語言（舊鍵 LANGUAGE 仍支援）
 """
 
 import json
@@ -24,7 +24,9 @@ def init(language: str = None):
     """初始化 i18n"""
     global _translations, _current_language
 
-    lang = language or os.getenv('LANGUAGE', DEFAULT_LANGUAGE)
+    # 優先讀專屬鍵 AI_BRIDGE_LANGUAGE；LANGUAGE 為向後相容的舊鍵，
+    # 但它是 POSIX/gettext 標準環境變數（Linux shell 常有 en_US:en 這類值），可能被系統覆蓋
+    lang = language or os.getenv('AI_BRIDGE_LANGUAGE') or os.getenv('LANGUAGE', DEFAULT_LANGUAGE)
     if lang not in SUPPORTED_LANGUAGES:
         logger.warning(f"不支援的語言 '{lang}'，使用預設 '{DEFAULT_LANGUAGE}'")
         lang = DEFAULT_LANGUAGE

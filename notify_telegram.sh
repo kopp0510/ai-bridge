@@ -8,6 +8,9 @@
 
 set -euo pipefail
 
+# 收緊本腳本建立的檔案權限（debug log、暫存檔可能含 AI 回應內容）
+umask 077
+
 # 讀取 hook 輸入（JSON）
 INPUT=$(cat)
 
@@ -144,7 +147,8 @@ ${LAST_MESSAGE}"
 log_debug "Sending to Telegram..."
 
 # 將原始回應寫入暫存檔（避免 shell ARG_MAX 限制）
-RAW_RESPONSE_FILE=$(mktemp "${TMPDIR:-/tmp}/ai_bridge_raw_XXXXXX.txt")
+# 注意：X 必須在模板結尾，否則 macOS mktemp 不會隨機化，併發 hook 會共用同一檔案
+RAW_RESPONSE_FILE=$(mktemp "${TMPDIR:-/tmp}/ai_bridge_raw_XXXXXX")
 printf '%s' "$LAST_MESSAGE" > "$RAW_RESPONSE_FILE"
 trap 'rm -f "$RAW_RESPONSE_FILE"' EXIT
 

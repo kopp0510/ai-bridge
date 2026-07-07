@@ -59,10 +59,10 @@ class TestCheckUserPermission:
             assert bot_module.check_user_permission(update) is False
 
     def test_empty_allowed_list(self):
-        """空列表允許所有用戶"""
+        """空列表拒絕所有用戶（fail-closed）"""
         update = make_update(user_id=999)
         with patch.object(bot_module, 'ALLOWED_USER_IDS', []):
-            assert bot_module.check_user_permission(update) is True
+            assert bot_module.check_user_permission(update) is False
 
 
 # ===== check_rate_limit =====

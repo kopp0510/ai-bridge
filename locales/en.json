@@ -97,6 +97,7 @@
     "reload_config_error": "❌ Config reload failed: {error}",
     "config_format_error": "Invalid config format: {file}",
     "queue_error": "Error processing queue message: {error}",
+    "send_failed": "Failed to deliver message to #{session} (tmux session may be down), check /status or /restart #{session}",
     "queue_processing": "[#{session}] Processing: {preview}...",
     "log_truncated": "Log truncated: {name}"
   },

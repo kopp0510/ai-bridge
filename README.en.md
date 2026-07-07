@@ -18,7 +18,7 @@ Interact bidirectionally with multiple running AI CLI instances (Claude Code, Ge
 - 📊 **Message Truncation**: Messages over 4000 characters are automatically truncated
 - 🔒 **User Authentication**: Only authorized users can access the bot
 - ⚡ **Message Queue**: Sequential processing to avoid conflicts
-- 🌐 **Multi-Language**: Switch between Traditional Chinese and English via `LANGUAGE` in `.env`
+- 🌐 **Multi-Language**: Switch between Traditional Chinese and English via `AI_BRIDGE_LANGUAGE` in `.env`
 
 ## Support Matrix
 
@@ -302,13 +302,13 @@ sessions:
 ```env
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 ALLOWED_USER_IDS=user_id_1,user_id_2
-LANGUAGE=en
+AI_BRIDGE_LANGUAGE=en
 ```
 
 **Variables:**
 - `TELEGRAM_BOT_TOKEN` - Required, obtained from BotFather
 - `ALLOWED_USER_IDS` - Required, comma-separated user IDs (bot refuses to start if empty)
-- `LANGUAGE` - Optional, UI language (`zh-TW` Traditional Chinese / `en` English, default `zh-TW`)
+- `AI_BRIDGE_LANGUAGE` - Optional, UI language (`zh-TW` Traditional Chinese / `en` English, default `zh-TW`). The legacy key `LANGUAGE` still works but clashes with the standard gettext environment variable and may be overridden by the system
 
 ## How It Works
 

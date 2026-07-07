@@ -13,8 +13,12 @@ import requests
 from datetime import datetime
 from requests.exceptions import RequestException, Timeout, ConnectionError as ReqConnectionError
 from dotenv import load_dotenv
-from config import config as app_config, patterns
+from config import config as app_config, patterns, redact_token
 from i18n import t
+from status_store import (
+    mark_session_busy as _mark_session_busy,
+    clear_session_busy as _clear_session_busy,
+)
 from tmux_bridge import send_keys_to_session
 
 # 設置日誌
@@ -25,11 +29,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # 配置常數
+# 重試預算必須低於最短的 hook timeout（Claude/Codex 為 30 秒），
+# 否則 hook 被 CLI 強制終止後，後續 chat 的通知會靜默丟失
 MAX_MESSAGE_LENGTH = app_config.telegram.MAX_SEND_LENGTH
-API_TIMEOUT = 10
-MAX_RETRIES = 3
+API_TIMEOUT = app_config.telegram.API_TIMEOUT
+MAX_RETRIES = 2
 RETRY_DELAY = 1.0
 RETRY_BACKOFF = 2.0
+MAX_RETRY_AFTER = 5  # 429 retry_after 上限（秒），避免 API 回傳大值時 sleep 超過 hook timeout
 
 
 def send_telegram_message(session_name: str, message: str) -> bool:
@@ -44,7 +51,9 @@ def send_telegram_message(session_name: str, message: str) -> bool:
         bool: 是否成功
     """
     # Load environment variables
-    load_dotenv()
+    # hook 的 cwd 是目標專案目錄，必須指定 bridge 自己的 .env 絕對路徑，
+    # 否則會誤讀目標專案的 .env（或完全讀不到）
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
     bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
     allowed_users = os.getenv('ALLOWED_USER_IDS', '')
@@ -119,6 +128,7 @@ def send_to_chat(bot_token: str, chat_id: str, message: str) -> bool:
             # 處理特定錯誤
             if error_code == 429:  # Too Many Requests
                 retry_after = error_data.get('parameters', {}).get('retry_after', 5)
+                retry_after = min(retry_after, MAX_RETRY_AFTER)
                 logger.warning(f"Rate limited, waiting {retry_after}s before retry")
                 time.sleep(retry_after)
                 continue
@@ -152,15 +162,16 @@ def send_to_chat(bot_token: str, chat_id: str, message: str) -> bool:
             logger.warning(f"Attempt {attempt + 1}/{MAX_RETRIES}: {last_error}")
 
         except ReqConnectionError as e:
-            last_error = f"Connection error: {e}"
+            # 例外訊息可能含 API URL（內嵌 token），記錄前遮罩
+            last_error = f"Connection error: {redact_token(e)}"
             logger.warning(f"Attempt {attempt + 1}/{MAX_RETRIES}: {last_error}")
 
         except RequestException as e:
-            last_error = f"Request error: {e}"
+            last_error = f"Request error: {redact_token(e)}"
             logger.warning(f"Attempt {attempt + 1}/{MAX_RETRIES}: {last_error}")
 
         except Exception as e:
-            last_error = f"Unexpected error: {e}"
+            last_error = f"Unexpected error: {redact_token(e)}"
             logger.error(f"Attempt {attempt + 1}/{MAX_RETRIES}: {last_error}")
 
         # 計算退避延遲
@@ -183,8 +194,8 @@ def process_chain(session_name: str, raw_response: str) -> bool:
 
     chain_dir = app_config.chain.CHAIN_DIR
 
-    # 清理孤兒 .claimed.* 檔案（進程 crash 後遺留，超過 5 分鐘視為過期）
-    CLAIMED_TTL = 300  # 5 分鐘
+    # 清理孤兒 .claimed.* 檔案（進程 crash 後遺留，超過 TTL 視為過期）
+    CLAIMED_TTL = app_config.chain.CLAIMED_TTL_SECONDS
     try:
         if os.path.isdir(chain_dir):
             now = time.time()
@@ -348,35 +359,6 @@ def process_chain(session_name: str, raw_response: str) -> bool:
 
     logger.info(f"Chain forwarded: {session_name} -> {target_session}")
     return True
-
-
-def _mark_session_busy(session_name: str):
-    """標記 session 為忙碌狀態"""
-    if not patterns.is_safe_session_name(session_name):
-        return
-    status_dir = app_config.status.STATUS_DIR
-    os.makedirs(status_dir, mode=0o700, exist_ok=True)
-    busy_file = os.path.join(status_dir, f"{session_name}.busy")
-    try:
-        fd = os.open(busy_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(datetime.now().isoformat())
-    except OSError as e:
-        logger.warning(f"Failed to mark session busy: {e}")
-
-
-def _clear_session_busy(session_name: str):
-    """清除 session 的忙碌標記"""
-    if not patterns.is_safe_session_name(session_name):
-        return
-    busy_file = os.path.join(app_config.status.STATUS_DIR,
-                             f"{session_name}.busy")
-    try:
-        os.remove(busy_file)
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        logger.warning(f"Failed to clear busy file: {e}")
 
 
 def _has_pending_chain(session_name: str) -> bool:
