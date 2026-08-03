@@ -2,7 +2,7 @@
 python-telegram-bot==22.5
 python-dotenv==1.1.1
 pyyaml==6.0.3
-requests==2.32.5
+requests>=2.32.5
 
 # 測試依賴
 pytest==9.0.2
