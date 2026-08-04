@@ -13,7 +13,7 @@ import requests
 from datetime import datetime
 from requests.exceptions import RequestException, Timeout, ConnectionError as ReqConnectionError
 from dotenv import load_dotenv
-from config import config as app_config, patterns, redact_token
+from config import config as app_config, patterns, redact_token, truncate_utf16_smart
 from i18n import t
 from status_store import (
     mark_session_busy as _mark_session_busy,
@@ -69,10 +69,10 @@ def send_telegram_message(session_name: str, message: str) -> bool:
         logger.error(t('notification.no_user_ids'))
         return False
 
-    # Truncate message if too long (Telegram limit is 4096)
-    truncated_message = message
-    if len(message) > MAX_MESSAGE_LENGTH:
-        truncated_message = message[:MAX_MESSAGE_LENGTH] + "\n\n" + t('notification.message_truncated')
+    # 超長時語意安全截斷（UTF-16 units 計，回退到段落/句末邊界並閉合 Markdown 圍欄）
+    truncated_message = truncate_utf16_smart(
+        message, MAX_MESSAGE_LENGTH,
+        "\n\n" + t('notification.message_truncated'))
 
     # Send to all allowed users
     success = True

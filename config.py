@@ -54,10 +54,15 @@ class SecurityConfig:
 
 @dataclass
 class TelegramConfig:
-    """Telegram 相關配置"""
-    MAX_SEND_LENGTH: int = 4000      # Telegram 發送訊息長度上限
-    MAX_TITLE_LENGTH: int = 3000     # 互動選項標題截斷長度
-    MAX_HEADER_LENGTH: int = 4000    # 按鈕訊息 header 上限（Telegram 上限 4096）
+    """Telegram 相關配置（長度上限以 UTF-16 code units 計，同 Telegram API）"""
+    MAX_SEND_LENGTH: int = 4000      # Telegram 發送訊息長度上限（UTF-16 units）
+    MAX_TITLE_LENGTH: int = 3000     # 互動選項標題截斷長度（UTF-16 units）
+    MAX_HEADER_LENGTH: int = 4000    # 按鈕訊息 header 上限（UTF-16 units，API 硬上限 4096）
+    API_MAX_MESSAGE_LENGTH: int = 4096   # Telegram sendMessage 硬上限（UTF-16 units）
+    MAX_BUTTON_TEXT_LENGTH: int = 64     # InlineKeyboard 按鈕文字截斷長度（UTF-16 units）
+    # callback_data 硬上限 64 bytes；扣最長前綴 'select_'(7) 與 ':50'(3) → 名稱預算 54 bytes(UTF-8)
+    MAX_SESSION_NAME_BYTES: int = 54
+    TRUNCATE_BOUNDARY_WINDOW: int = 500  # 語意截斷回看窗（UTF-16 units）
     API_TIMEOUT: int = 10            # Telegram API 請求逾時（秒）
 
 
@@ -159,13 +164,90 @@ class CompiledPatterns:
     # Session 名稱安全性驗證（檔案操作前必須呼叫）
     @staticmethod
     def is_safe_session_name(name: str) -> bool:
-        """驗證 session 名稱不含路徑穿越字元"""
-        return bool(CompiledPatterns.SESSION_NAME.match(name))
+        """驗證 session 名稱：字元白名單 + callback_data 長度預算（64 bytes 扣前綴）"""
+        return (bool(CompiledPatterns.SESSION_NAME.match(name))
+                and len(name.encode('utf-8')) <= TelegramConfig.MAX_SESSION_NAME_BYTES)
 
 
 def redact_token(text) -> str:
     """遮罩文字中的 Telegram Bot Token（例外訊息可能含 API URL，避免 token 寫入日誌）"""
     return CompiledPatterns.BOT_TOKEN.sub('bot***', str(text))
+
+
+def utf16_len(text: str) -> int:
+    """回傳 UTF-16 code units 長度（Telegram 4096 上限以此計算；astral 字元如 emoji 佔 2）"""
+    return sum(2 if ord(c) > 0xFFFF else 1 for c in text)
+
+
+def _cut_at_units(text: str, max_units: int) -> str:
+    """取頭部至多 max_units（逐 code point 累計，天然不切斷 surrogate pair）"""
+    units = 0
+    for i, c in enumerate(text):
+        units += 2 if ord(c) > 0xFFFF else 1
+        if units > max_units:
+            return text[:i]
+    return text
+
+
+def truncate_utf16(text: str, max_units: int, suffix: str = "") -> str:
+    """硬截斷至 max_units（UTF-16 units，含 suffix）。上限內原樣返回（不加 suffix）。"""
+    if utf16_len(text) <= max_units:
+        return text
+    return _cut_at_units(text, max_units - utf16_len(suffix)) + suffix
+
+
+def truncate_utf16_tail(text: str, max_units: int) -> str:
+    """同 truncate_utf16 但保留尾部（互動選項標題語意：提問重點在尾部）"""
+    if utf16_len(text) <= max_units:
+        return text
+    units = 0
+    for i in range(len(text) - 1, -1, -1):
+        units += 2 if ord(text[i]) > 0xFFFF else 1
+        if units > max_units:
+            return text[i + 1:]
+    return text
+
+
+# 語意截斷的句末邊界：CJK 標點本身即句界；ASCII .!? 須後接空白/結尾（避免切在 3.14、URL 等）
+_SENTENCE_BOUNDARY = re.compile(r'[。！？．]|[.!?](?=\s|$)', re.MULTILINE)
+
+
+def truncate_utf16_smart(text: str, max_units: int, suffix: str = "") -> str:
+    """語意安全截斷：截斷點回退到最近的段落/行/句末邊界（回看窗內），
+    並在截斷造成 Markdown 圍欄（```）不成對時補上閉合，避免內容意思偏差。
+    上限內原樣返回（不加 suffix）。"""
+    if utf16_len(text) <= max_units:
+        return text
+
+    fence = '```'
+    # 預留 suffix 與可能的圍欄閉合（\n``` = 4 units）
+    budget = max_units - utf16_len(suffix) - 4
+    head = _cut_at_units(text, budget)
+
+    # 在回看窗內找最近的自然邊界
+    window_start = len(_cut_at_units(head, max(0, budget - TelegramConfig.TRUNCATE_BOUNDARY_WINDOW)))
+    window = head[window_start:]
+    cut = -1
+    para = window.rfind('\n\n')
+    if para != -1:
+        cut = window_start + para
+    else:
+        line = window.rfind('\n')
+        if line != -1:
+            cut = window_start + line
+        else:
+            last = None
+            for m in _SENTENCE_BOUNDARY.finditer(window):
+                last = m
+            if last is not None:
+                cut = window_start + last.end()
+    if cut > 0:
+        head = head[:cut]
+
+    head = head.rstrip()
+    if head.count(fence) % 2 == 1:
+        head += '\n' + fence
+    return head + suffix
 
 
 # 預編譯模式實例

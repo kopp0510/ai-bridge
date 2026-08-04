@@ -94,7 +94,7 @@
     "config_not_found": "❌ 找不到配置文件: {file}",
     "config_load_failed": "❌ 載入配置失敗: {error}",
     "config_loaded": "✅ 載入 {count} 個會話配置",
-    "invalid_session_name": "⚠️ 略過不合法的會話名稱 '{name}'（僅允許字母、數字、底線、連字號）",
+    "invalid_session_name": "⚠️ 略過不合法的會話名稱 '{name}'（僅允許字母、數字、底線、連字號，且 UTF-8 長度不超過 54 bytes）",
     "reload_config_error": "❌ 重載配置失敗: {error}",
     "config_format_error": "配置文件格式錯誤: {file}",
     "queue_error": "處理佇列訊息時錯誤: {error}",
@@ -145,7 +145,7 @@
     "token_not_found": "TELEGRAM_BOT_TOKEN 未在 .env 中設定",
     "no_user_ids": "未配置 ALLOWED_USER_IDS",
     "invalid_chat_id": "無效的 chat_id '{chat_id}'：不是有效整數",
-    "message_truncated": "_[訊息已截斷]_"
+    "message_truncated": "_[訊息過長已截斷，完整內容請於 CLI 查看]_"
   },
   "poll": {
     "options_detected": "📋 [#{session}] 偵測到互動選項："

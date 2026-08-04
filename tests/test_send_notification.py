@@ -99,11 +99,36 @@ class TestSendTelegramNotification:
         long_message = "x" * 5000
         send_telegram_message("test", long_message)
 
-        # 驗證 send_to_chat 收到截斷後的訊息
+        # 驗證 send_to_chat 收到截斷後的訊息（後綴計入 4000 預算內）
+        from config import utf16_len
         actual_message = mock_send.call_args[0][2]
-        assert len(actual_message) < 5000
-        assert actual_message.startswith("x" * 4000)
-        assert "訊息已截斷" in actual_message
+        assert utf16_len(actual_message) <= 4000
+        assert actual_message.startswith("x" * 3900)
+        assert "截斷" in actual_message
+
+    @patch('send_telegram_notification.send_to_chat')
+    @patch('send_telegram_notification.load_dotenv')
+    @patch('send_telegram_notification.os.getenv')
+    def test_message_truncation_emoji_utf16(self, mock_getenv, mock_load_dotenv, mock_send):
+        """回歸：emoji 佔 2 個 UTF-16 units，截斷後不得超過 Telegram 4096 上限"""
+        from config import utf16_len
+
+        def getenv_side_effect(key, default=''):
+            if key == 'TELEGRAM_BOT_TOKEN':
+                return 'test_token'
+            if key == 'ALLOWED_USER_IDS':
+                return '123'
+            return default
+
+        mock_getenv.side_effect = getenv_side_effect
+        mock_send.return_value = True
+
+        # 3000 code points = 6000 UTF-16 units（舊碼用 len() 不會截斷）
+        send_telegram_message("test", "😀" * 3000)
+
+        actual_message = mock_send.call_args[0][2]
+        assert utf16_len(actual_message) <= 4096
+        assert "截斷" in actual_message
 
     @patch('send_telegram_notification.time.sleep')
     @patch('send_telegram_notification.requests.post')

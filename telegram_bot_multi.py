@@ -28,7 +28,10 @@ import requests
 from session_manager import SessionManager
 from message_router import MessageRouter
 import hashlib
-from config import config as app_config, patterns, redact_token
+from config import (
+    config as app_config, patterns, redact_token,
+    truncate_utf16, truncate_utf16_smart, utf16_len,
+)
 from status_store import (
     mark_session_busy as _mark_session_busy,
     get_session_busy_seconds as _get_session_busy_seconds,
@@ -128,6 +131,17 @@ def check_rate_limit(user_id: int) -> bool:
         return True
 
 
+def _safe_text(text: str) -> str:
+    """出站訊息長度防護：語意安全截斷至 MAX_SEND_LENGTH（UTF-16 units），防 Telegram 400"""
+    return truncate_utf16_smart(text, app_config.telegram.MAX_SEND_LENGTH, "⋯")
+
+
+def _compose_edit_text(original: str, appendix: str) -> str:
+    """原訊息 + 追加行，總長不超過 API 硬上限；超限時截原文、保留追加行（使用者要看的確認文字）"""
+    budget = max(0, app_config.telegram.API_MAX_MESSAGE_LENGTH - utf16_len(appendix) - 2)
+    return truncate_utf16(original, budget, "⋯") + "\n\n" + appendix
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """處理 /start 命令"""
     if not check_user_permission(update):
@@ -151,7 +165,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 {t('chain.cmd_chain')}
 """
 
-    await update.message.reply_text(welcome_message)
+    await update.message.reply_text(_safe_text(welcome_message))
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -180,7 +194,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"   {t('status_cmd.idle')}")
         lines.append(f"   {t('status_cmd.notification')}: {t('status_cmd.hook_driven')}\n")
 
-    await update.message.reply_text('\n'.join(lines))
+    await update.message.reply_text(_safe_text('\n'.join(lines)))
 
 
 async def sessions_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -190,7 +204,7 @@ async def sessions_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sessions_text = bot_state.message_router.format_session_list() if bot_state.message_router else t('session.not_initialized')
-    await update.message.reply_text(sessions_text)
+    await update.message.reply_text(_safe_text(sessions_text))
 
 
 async def restart_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,7 +220,7 @@ async def restart_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session_name = context.args[0].replace('#', '').replace('@', '')
 
     if not patterns.is_safe_session_name(session_name) or not bot_state.session_manager.get_session(session_name):
-        await update.message.reply_text(t('session.not_found', name=session_name))
+        await update.message.reply_text(_safe_text(t('session.not_found', name=session_name)))
         return
 
     await update.message.reply_text(t('session.restarting', name=session_name))
@@ -245,9 +259,9 @@ async def reload_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if details:
             full_message += "\n\n" + "\n".join(details)
 
-        await update.message.reply_text(full_message)
+        await update.message.reply_text(_safe_text(full_message))
     else:
-        await update.message.reply_text(f"❌ {message}")
+        await update.message.reply_text(_safe_text(f"❌ {message}"))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -279,13 +293,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 檢查錯誤
     if routes and routes[0][0] == '__error__':
-        await update.message.reply_text(f"❌ {routes[0][1]}")
+        await update.message.reply_text(_safe_text(f"❌ {routes[0][1]}"))
         return
 
-    # 將訊息放入佇列
+    # 將訊息放入佇列（附加回應長度提示，讓 AI 主動控制在 TG 上限內；硬截斷仍為最終保證）
+    # 極短訊息不注入：可能是在回覆 CLI 互動選單（如 "2"、"yes"），
+    # 附加的 hint 會在數字被選單即時消化後打進下一個 prompt
+    length_hint = t('session.length_hint', max_chars=app_config.telegram.MAX_SEND_LENGTH)
     for session_name, actual_message in routes:
+        stripped = actual_message.strip()
+        if len(stripped) <= 4 or stripped.isdigit():
+            queued_message = actual_message
+        else:
+            queued_message = actual_message + length_hint
         try:
-            bot_state.message_queue.put_nowait((session_name, actual_message))
+            bot_state.message_queue.put_nowait((session_name, queued_message))
         except queue.Full:
             await update.message.reply_text(t('bot.queue_full'))
             return
@@ -307,7 +329,7 @@ async def _handle_chain_message(update: Update, user_message: str):
     first_routes = bot_state.message_router.parse_message(segments[0].strip())
     if not first_routes or first_routes[0][0] == '__error__':
         error_msg = first_routes[0][1] if first_routes else t('chain.invalid_syntax', segment=segments[0].strip())
-        await update.message.reply_text(f"❌ {error_msg}")
+        await update.message.reply_text(_safe_text(f"❌ {error_msg}"))
         return
 
     source_session = first_routes[0][0]
@@ -326,18 +348,18 @@ async def _handle_chain_message(update: Update, user_message: str):
         seg = seg.strip()
         match = patterns.CHAIN_TARGET.match(seg)
         if not match:
-            await update.message.reply_text(t('chain.invalid_syntax', segment=seg))
+            await update.message.reply_text(_safe_text(t('chain.invalid_syntax', segment=seg)))
             return
         target_name = match.group(1)
         # 循環偵測：同一 session 不可出現兩次
         if target_name in seen_sessions:
-            await update.message.reply_text(t('chain.cycle_detected', name=target_name))
+            await update.message.reply_text(_safe_text(t('chain.cycle_detected', name=target_name)))
             return
         seen_sessions.add(target_name)
         prefix = (match.group(2) or '').strip()
         session_config = bot_state.session_manager.get_session(target_name)
         if not session_config:
-            await update.message.reply_text(t('chain.invalid_target', name=target_name))
+            await update.message.reply_text(_safe_text(t('chain.invalid_target', name=target_name)))
             return
         chain_steps.append((target_name, prefix, session_config))
 
@@ -347,7 +369,7 @@ async def _handle_chain_message(update: Update, user_message: str):
         _write_chain_file(source_session, chain_steps, all_names)
     except (OSError, ValueError) as e:
         logger.error(f"Failed to write chain file: {e}")
-        await update.message.reply_text(f"❌ {e}")
+        await update.message.reply_text(_safe_text(f"❌ {e}"))
         return
 
     # 串接提示放最前面（A 的回應會寫入檔案給 B 讀取，不需嚴格字元限制）
@@ -408,7 +430,7 @@ async def chain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and len(context.args) >= 2 and context.args[0] == 'cancel':
         session_name = context.args[1].replace('#', '')
         if not patterns.is_safe_session_name(session_name):
-            await update.message.reply_text(t('session.not_found', name=session_name))
+            await update.message.reply_text(_safe_text(t('session.not_found', name=session_name)))
             return
         chain_file = os.path.join(chain_dir, f"{session_name}.json")
         if os.path.exists(chain_file):
@@ -442,7 +464,7 @@ async def chain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text = t('chain.no_active')
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(_safe_text(text))
 
 
 def _parse_callback_data(data: str, prefix: str) -> tuple:
@@ -514,7 +536,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _mark_poll_sent(session_name)
 
         await query.edit_message_text(
-            text=f"{query.message.text}\n\n✏️ {t('callback.text_input_hint', session=session_name)}",
+            text=_compose_edit_text(query.message.text,
+                                    f"✏️ {t('callback.text_input_hint', session=session_name)}"),
             reply_markup=None
         )
         return
@@ -530,7 +553,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _mark_poll_sent(session_name)
 
         await query.edit_message_text(
-            text=f"{query.message.text}\n\n{t('callback.selected', session=session_name, choice=choice_num)}",
+            text=_compose_edit_text(query.message.text,
+                                    t('callback.selected', session=session_name, choice=choice_num)),
             reply_markup=None
         )
         return
@@ -547,7 +571,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_state.message_queue.put_nowait((session_name, choice))
     except queue.Full:
         await query.edit_message_text(
-            text=f"{query.message.text}\n\n{t('callback.queue_full')}",
+            text=_compose_edit_text(query.message.text, t('callback.queue_full')),
             reply_markup=None
         )
         return
@@ -555,7 +579,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _mark_poll_sent(session_name)
 
     await query.edit_message_text(
-        text=f"{query.message.text}\n\n{t('callback.selected', session=session_name, choice=choice)}",
+        text=_compose_edit_text(query.message.text,
+                                t('callback.selected', session=session_name, choice=choice)),
         reply_markup=None
     )
 
@@ -564,6 +589,7 @@ def _send_telegram_text(text: str) -> None:
     """從背景執行緒發送純文字訊息到 Telegram（worker 執行緒無法使用 async，用同步 requests）"""
     if not bot_state.telegram_chat_id:
         return
+    text = _safe_text(text)
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         requests.post(
@@ -850,10 +876,8 @@ def interaction_polling_worker():
                 header_parts = [f"📋 [#{name}]"]
                 if title:
                     header_parts.append(title)
-                header = '\n'.join(header_parts)
-                max_header = app_config.telegram.MAX_HEADER_LENGTH
-                if len(header) > max_header:
-                    header = header[:max_header] + "\n\n⋯"
+                header = truncate_utf16('\n'.join(header_parts),
+                                        app_config.telegram.MAX_HEADER_LENGTH, "\n\n⋯")
 
                 # 組合 InlineKeyboard 並用 requests 直接呼叫 Telegram API
                 # （輪詢執行緒無法使用 async，故用同步 requests）
@@ -863,6 +887,7 @@ def interaction_polling_worker():
                         is_text_input = any(kw.lower() in label.lower() for kw in TEXT_INPUT_KEYWORDS)
                         prefix = "input_" if is_text_input else "select_"
                         btn_label = f"✏️ {num}. {label}" if is_text_input else f"{num}. {label}"
+                        btn_label = truncate_utf16(btn_label, app_config.telegram.MAX_BUTTON_TEXT_LENGTH, "⋯")
                         inline_keyboard.append([{"text": btn_label, "callback_data": f"{prefix}{name}:{num}"}])
                     payload = {
                         "chat_id": bot_state.telegram_chat_id,

@@ -12,7 +12,7 @@
 
 import re
 
-from config import config as app_config, patterns
+from config import config as app_config, patterns, truncate_utf16_tail
 
 # 文字輸入選項的關鍵字（選擇後需要使用者追加輸入）
 TEXT_INPUT_KEYWORDS = ['Type something', 'Tell Claude what to change',
@@ -96,9 +96,7 @@ def _extract_options_claude(text: str) -> tuple:
                 break
             title_lines.insert(0, line)
         title = '\n'.join(title_lines)
-        max_len = app_config.telegram.MAX_TITLE_LENGTH
-        if len(title) > max_len:
-            title = title[-max_len:]
+        title = truncate_utf16_tail(title, app_config.telegram.MAX_TITLE_LENGTH)
 
     return title, options
 
@@ -151,9 +149,7 @@ def _extract_options_gemini(text: str) -> tuple:
             title_lines.append(cleaned_line)
 
     title = '\n'.join(title_lines)
-    max_len = app_config.telegram.MAX_TITLE_LENGTH
-    if len(title) > max_len:
-        title = title[-max_len:]
+    title = truncate_utf16_tail(title, app_config.telegram.MAX_TITLE_LENGTH)
 
     return title, options
 
@@ -216,9 +212,7 @@ def _extract_options_codex(text: str) -> tuple:
         title_lines.insert(0, line)
 
     title = '\n'.join(title_lines)
-    max_len = app_config.telegram.MAX_TITLE_LENGTH
-    if len(title) > max_len:
-        title = title[-max_len:]
+    title = truncate_utf16_tail(title, app_config.telegram.MAX_TITLE_LENGTH)
 
     return title, options
 

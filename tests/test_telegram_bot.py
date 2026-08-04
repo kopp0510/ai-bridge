@@ -329,10 +329,10 @@ class TestHandleMessage:
 
     @pytest.mark.asyncio
     async def test_successful_route_single(self):
-        """正常路由到單一會話"""
-        update = make_update(user_id=123, text="#proj 你好")
+        """正常路由到單一會話（一般訊息注入長度提示）"""
+        update = make_update(user_id=123, text="#proj 請幫我分析這個模組的架構")
         mock_router = MagicMock()
-        mock_router.parse_message.return_value = [('proj', '你好')]
+        mock_router.parse_message.return_value = [('proj', '請幫我分析這個模組的架構')]
 
         test_queue = queue.Queue(maxsize=100)
 
@@ -342,9 +342,28 @@ class TestHandleMessage:
             await bot_module.handle_message(update, make_context())
 
         assert test_queue.qsize() == 1
-        assert test_queue.get_nowait() == ('proj', '你好')
+        name, msg = test_queue.get_nowait()
+        assert name == 'proj'
+        assert msg.startswith('請幫我分析這個模組的架構')
+        assert '回應限制' in msg  # session.length_hint 已注入
         reply = update.message.reply_text.call_args[0][0]
         assert "#proj" in reply
+
+    @pytest.mark.asyncio
+    async def test_short_message_no_length_hint(self):
+        """極短訊息（互動選單回覆）不注入長度提示"""
+        update = make_update(user_id=123, text="#proj 2")
+        mock_router = MagicMock()
+        mock_router.parse_message.return_value = [('proj', '2')]
+
+        test_queue = queue.Queue(maxsize=100)
+
+        with patch.object(bot_module, 'ALLOWED_USER_IDS', ['123']), \
+             patch.object(bot_module.bot_state, 'message_router', mock_router), \
+             patch.object(bot_module.bot_state, 'message_queue', test_queue):
+            await bot_module.handle_message(update, make_context())
+
+        assert test_queue.get_nowait() == ('proj', '2')
 
     @pytest.mark.asyncio
     async def test_successful_route_all(self):
@@ -363,6 +382,21 @@ class TestHandleMessage:
         assert test_queue.qsize() == 2
         reply = update.message.reply_text.call_args[0][0]
         assert "2 個會話" in reply
+
+    @pytest.mark.asyncio
+    async def test_long_error_reply_truncated(self):
+        """回顯超長使用者輸入的錯誤訊息不超過 Telegram 上限"""
+        from config import utf16_len
+        update = make_update(user_id=123, text="#" + "x" * 9000)
+        mock_router = MagicMock()
+        mock_router.parse_message.return_value = [('__error__', '會話不存在: ' + 'x' * 9000)]
+
+        with patch.object(bot_module, 'ALLOWED_USER_IDS', ['123']), \
+             patch.object(bot_module.bot_state, 'message_router', mock_router):
+            await bot_module.handle_message(update, make_context())
+
+        reply = update.message.reply_text.call_args[0][0]
+        assert utf16_len(reply) <= 4096
 
     @pytest.mark.asyncio
     async def test_queue_full(self):
@@ -442,6 +476,47 @@ class TestButtonCallback:
         session_name, choice = test_queue.get_nowait()
         assert session_name == "mac_claude"
         assert choice == "3"
+
+    @pytest.mark.asyncio
+    async def test_edit_text_within_api_limit(self):
+        """原訊息接近上限時，加料後的 edit 內容不超過 4096 且保留追加行"""
+        from config import utf16_len
+        update = make_callback_query(user_id=123, data="choice_proj:1",
+                                     message_text="x" * 4000 + "😀" * 50)
+        test_queue = queue.Queue(maxsize=100)
+
+        with patch.object(bot_module, 'ALLOWED_USER_IDS', ['123']), \
+             patch.object(bot_module.bot_state, 'message_queue', test_queue):
+            await bot_module.button_callback(update, make_context())
+
+        sent_text = update.callback_query.edit_message_text.call_args[1]['text']
+        assert utf16_len(sent_text) <= 4096
+        assert "已選擇" in sent_text  # 追加行（callback.selected）完整保留
+
+
+# ===== 出站長度防護 helpers =====
+
+class TestOutboundLengthHelpers:
+    """_safe_text / _compose_edit_text 測試"""
+
+    def test_safe_text_within_limit(self):
+        assert bot_module._safe_text("hello") == "hello"
+
+    def test_safe_text_truncates(self):
+        from config import utf16_len
+        result = bot_module._safe_text("x" * 9000)
+        assert utf16_len(result) <= 4000
+        assert result.endswith("⋯")
+
+    def test_compose_edit_text_short(self):
+        result = bot_module._compose_edit_text("原文", "追加")
+        assert result == "原文\n\n追加"
+
+    def test_compose_edit_text_keeps_appendix(self):
+        from config import utf16_len
+        result = bot_module._compose_edit_text("x" * 5000, "✅ 已選擇: 1")
+        assert utf16_len(result) <= 4096
+        assert result.endswith("✅ 已選擇: 1")
 
 
 # ===== load_sessions_config =====
@@ -563,6 +638,35 @@ class TestReloadSessionsConfig:
         assert 'removed' in changes['removed']
         assert 'kept' in changes['kept']
         mock_old_manager.kill_session.assert_called_once_with('removed')
+
+    def test_overlong_session_name_skipped(self):
+        """超過 54 bytes 的 session 名（callback_data 預算）被略過並警告"""
+        yaml_content = {
+            'sessions': [
+                {'name': 'a' * 55, 'path': '/tmp/too-long'},
+                {'name': 'ok', 'path': '/tmp/ok'},
+            ]
+        }
+
+        mock_old_manager = MagicMock()
+        mock_old_manager.get_all_sessions.return_value = []
+
+        mock_new_manager = MagicMock()
+        mock_new_bridge = MagicMock()
+        mock_new_bridge.session_exists.return_value = True
+        mock_new_manager.get_bridge.return_value = mock_new_bridge
+
+        with patch('builtins.open', MagicMock()), \
+             patch('yaml.safe_load', return_value=yaml_content), \
+             patch.object(bot_module, 'SessionManager', return_value=mock_new_manager), \
+             patch.object(bot_module, 'MessageRouter'), \
+             patch.object(bot_module.bot_state, 'session_manager', mock_old_manager), \
+             patch.object(bot_module.bot_state, 'update_manager_and_router'):
+            success, msg, changes = bot_module.reload_sessions_config()
+
+        assert success is True
+        assert changes['added'] == ['ok']
+        assert 'a' * 55 not in changes['added']
 
 
 class TestLogRotation:

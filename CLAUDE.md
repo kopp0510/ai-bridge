@@ -139,6 +139,10 @@ interaction_polling_worker → tmux 日誌/capture-pane 輪詢 → 偵測互動�
 - `.claimed.{pid}` 孤兒檔案每次 `process_chain()` 呼叫時自動清理（超過 5 分鐘）
 
 ### Telegram 發送
+- **長度上限以 UTF-16 code units 計**（同 Telegram API 的 4096；emoji 佔 2 units）：截斷一律用 `config.py` 的 `truncate_utf16*` 系列，不可用 `len()`/切片
+- **語意安全截斷**：`truncate_utf16_smart()` 回退到段落/行/句末邊界（回看窗 500 units）並閉合不成對的 ``` 圍欄；主通知路徑用它 + `notification.message_truncated` 後綴，bot 端 `_safe_text()` 用它 + 純符號 `⋯`（錯誤/狀態訊息不適用「請於 CLI 查看」文案）
+- **長度提示注入**：一般訊息入佇列前附加 `session.length_hint`（讓 AI 主動控制在 4000 字內）；**極短訊息（≤4 字元或純數字）不注入**（可能是互動選單回覆）；chain 路徑已有 `chain.length_hint`，勿重複疊加
+- **session 名長度上限 54 UTF-8 bytes**（`is_safe_session_name` 強制）：callback_data 硬上限 64 bytes 扣 `select_` 前綴與 `:NN` 序號的預算；中文名最多 18 字
 - Markdown 解析失敗時自動 fallback 為純文字重發
 - hook 發送重試預算低於 hook timeout（30 秒）：`MAX_RETRIES=2`、429 的 `retry_after` 上限 5 秒，避免 hook 被 CLI 強制終止導致後續通知丟失
 - 佇列訊息發送失敗（tmux 會話死亡）會回推錯誤訊息給使用者且不標記 busy

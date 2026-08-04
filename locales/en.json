@@ -94,7 +94,7 @@
     "config_not_found": "❌ Config file not found: {file}",
     "config_load_failed": "❌ Failed to load config: {error}",
     "config_loaded": "✅ Loaded {count} session configs",
-    "invalid_session_name": "⚠️ Skipped invalid session name '{name}' (only letters, digits, underscore, hyphen allowed)",
+    "invalid_session_name": "⚠️ Skipped invalid session name '{name}' (only letters, digits, underscore, hyphen allowed; max 54 UTF-8 bytes)",
     "reload_config_error": "❌ Config reload failed: {error}",
     "config_format_error": "Invalid config format: {file}",
     "queue_error": "Error processing queue message: {error}",
@@ -145,7 +145,7 @@
     "token_not_found": "TELEGRAM_BOT_TOKEN not found in .env",
     "no_user_ids": "No ALLOWED_USER_IDS configured",
     "invalid_chat_id": "Invalid chat_id '{chat_id}': not a valid integer",
-    "message_truncated": "_[Message truncated]_"
+    "message_truncated": "_[Message too long, truncated — see full content in the CLI]_"
   },
   "poll": {
     "options_detected": "📋 [#{session}] Interactive options detected:"
