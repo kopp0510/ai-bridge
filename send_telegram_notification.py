@@ -145,7 +145,7 @@ def send_to_chat(bot_token: str, chat_id: str, message: str) -> bool:
                         return True
                     logger.error(f"Plain text fallback also failed: {resp.status_code}")
                 except Exception as e:
-                    logger.error(f"Plain text fallback error: {e}")
+                    logger.error(f"Plain text fallback error: {redact_token(e)}")
                 return False
 
             if error_code in [400, 401, 403, 404]:
@@ -294,7 +294,8 @@ def process_chain(session_name: str, raw_response: str) -> bool:
     # 2. 將 A 的回應寫入暫存 .md 檔案（放在 B 的工作目錄內，確保可讀取）
     chain_result_file = os.path.join(target_path, f".ai_bridge_chain_{session_name}.md")
     try:
-        fd = os.open(chain_result_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # O_NOFOLLOW：目標目錄內若被植入同名 symlink，拒絕跟隨截斷任意檔案
+        fd = os.open(chain_result_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(raw_response)
     except OSError as e:

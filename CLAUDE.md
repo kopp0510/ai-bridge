@@ -18,8 +18,9 @@
 # 手動前台執行（開發用）
 python3 telegram_bot_multi.py
 
-# 測試
-pytest                     # 執行所有測試（~226 個）
+# 測試（依賴在 requirements-dev.txt，生產只需 requirements.txt）
+pip install -r requirements-dev.txt
+pytest                     # 執行所有測試（~227 個）
 pytest --cov               # 含覆蓋率
 
 # 配置
@@ -151,7 +152,9 @@ interaction_polling_worker → tmux 日誌/capture-pane 輪詢 → 偵測互動�
 - **權限**：`.env` 於 validate/start 時自動收緊為 600；`bot.log`、hook debug 日誌與暫存檔以 `umask 077` 建立；例外訊息寫入日誌前遮罩 bot token
 
 ### 其他
-- 會話名稱模式：`[\w\-]+`
+- **Python ≥ 3.11 硬需求**：`cli_provider.py` 使用標準庫 `tomllib`；`bridge.sh validate` 會檢查版本
+- **CI**：`.github/workflows/ci.yml` 於 push/PR 執行 shell 語法檢查（`bash -n`）+ pytest（Python 3.11–3.13 matrix）
+- 會話名稱模式：`[\w\-]+`；sessions.yaml 的 `name` 需為字串（YAML 會把 `2024`、`no` 解析成 int/bool，載入時會被略過並警告）
 - `shlex.quote()` 防護 shell 注入
 - ALLOWED_USER_IDS 為必填，空白拒絕啟動
 - 每用戶速率限制：5 秒內最多 3 則

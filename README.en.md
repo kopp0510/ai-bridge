@@ -111,7 +111,7 @@ Interact bidirectionally with multiple running AI CLI instances (Claude Code, Ge
 
 1. **CLI is logged in**: Run `claude`, `gemini`, or `codex` in terminal and confirm it works interactively (not a login screen)
 2. **tmux is installed**: `tmux -V`
-3. **Python 3.8+**: `python3 --version`
+3. **Python 3.11+** (uses stdlib `tomllib`): `python3 --version`
 
 ### 1. Install Dependencies
 
@@ -121,6 +121,9 @@ brew install tmux
 
 # Install Python dependencies
 pip install -r requirements.txt
+
+# (only needed for development / running tests)
+pip install -r requirements-dev.txt
 ```
 
 ### 2. Create a Telegram Bot
@@ -357,7 +360,8 @@ AI_BRIDGE_LANGUAGE=en
 - `bridge.sh` - Unified management tool (start/stop/restart/status/logs/validate)
 - `sessions.yaml` - Session configuration
 - `.env` - Environment variables
-- `requirements.txt` - Python dependencies
+- `requirements.txt` - Python runtime dependencies
+- `requirements-dev.txt` - Development/test dependencies
 
 ## Security
 
@@ -367,7 +371,7 @@ AI_BRIDGE_LANGUAGE=en
 4. **Network Security**: Uses Polling mode, no public URL required
 5. **Shell Injection Protection**: `shlex.quote()` is used for pipe-pane paths and hook commands
 6. **Rate Limiting**: Maximum 3 messages per user per 5 seconds
-7. **Pinned Dependencies**: Exact versions locked to prevent supply chain attacks
+7. **Pinned Dependencies**: Exact versions locked to prevent supply chain attacks; only `requests` uses a `>=` lower bound to pick up security patches automatically
 
 ## Troubleshooting
 

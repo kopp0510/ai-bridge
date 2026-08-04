@@ -135,6 +135,35 @@ class TestSendTelegramNotification:
 
     @patch('send_telegram_notification.time.sleep')
     @patch('send_telegram_notification.requests.post')
+    def test_markdown_fallback_error_redacts_token(self, mock_post, mock_sleep, caplog):
+        """回歸：fallback 例外訊息含 API URL 時，日誌不得出現明文 token"""
+        token = '12345:AAbbCCdd-test'
+
+        # 第一次：Markdown 解析失敗，觸發純文字 fallback
+        mock_fail = MagicMock()
+        mock_fail.ok = False
+        mock_fail.json.return_value = {
+            'error_code': 400,
+            'description': "Bad Request: can't parse entities"
+        }
+        mock_fail.status_code = 400
+        mock_fail.text = "can't parse entities"
+
+        # 第二次（fallback）：連線例外，訊息內嵌含 token 的 URL
+        mock_post.side_effect = [
+            mock_fail,
+            Exception(f"Max retries exceeded with url: /bot{token}/sendMessage"),
+        ]
+
+        with caplog.at_level('ERROR', logger='send_telegram_notification'):
+            result = send_to_chat(token, "123", "**bad markdown")
+
+        assert result is False
+        assert token not in caplog.text
+        assert 'bot***' in caplog.text
+
+    @patch('send_telegram_notification.time.sleep')
+    @patch('send_telegram_notification.requests.post')
     def test_rate_limit_429(self, mock_post, mock_sleep):
         """測試 429 速率限制處理"""
         # 第一次：429 Too Many Requests

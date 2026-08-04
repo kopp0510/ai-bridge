@@ -94,6 +94,7 @@
     "config_not_found": "❌ Config file not found: {file}",
     "config_load_failed": "❌ Failed to load config: {error}",
     "config_loaded": "✅ Loaded {count} session configs",
+    "invalid_session_name": "⚠️ Skipped invalid session name '{name}' (only letters, digits, underscore, hyphen allowed)",
     "reload_config_error": "❌ Config reload failed: {error}",
     "config_format_error": "Invalid config format: {file}",
     "queue_error": "Error processing queue message: {error}",

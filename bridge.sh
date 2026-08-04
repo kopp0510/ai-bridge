@@ -83,6 +83,19 @@ do_validate() {
         PYTHON="$VENV_DIR/bin/python3"
     fi
 
+    # 0. Python 版本（cli_provider.py 使用 tomllib，需 ≥ 3.11）
+    local py_version
+    py_version=$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "")
+    if [ -z "$py_version" ]; then
+        error "$MSG_PYTHON_NOT_FOUND"
+        errors=$((errors + 1))
+    elif ! "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+        error "$(printf "$MSG_PYTHON_TOO_OLD" "$py_version")"
+        errors=$((errors + 1))
+    else
+        info "$(printf "$MSG_PYTHON_OK" "$py_version")"
+    fi
+
     # 1. .env 存在
     if [ -f "$SCRIPT_DIR/.env" ]; then
         info "$MSG_ENV_EXISTS"
@@ -257,7 +270,7 @@ except Exception:
     # 6. Python 依賴
     if [ -d "$VENV_DIR" ]; then
         info "$MSG_VENV_EXISTS"
-        if "$VENV_DIR/bin/python3" -c "import telegram; import yaml; import requests" 2>/dev/null; then
+        if "$VENV_DIR/bin/python3" -c "import telegram; import yaml; import requests; import dotenv" 2>/dev/null; then
             info "$MSG_DEPS_INSTALLED"
         else
             warn "$MSG_DEPS_INCOMPLETE"
@@ -316,7 +329,7 @@ do_start() {
 
     # 啟動虛擬環境並安裝依賴
     source "$VENV_DIR/bin/activate"
-    if ! python3 -c "import telegram; import yaml; import requests" 2>/dev/null; then
+    if ! python3 -c "import telegram; import yaml; import requests; import dotenv" 2>/dev/null; then
         step "$MSG_STEP_INSTALL_DEPS"
         pip3 install -q -r "$SCRIPT_DIR/requirements.txt"
     fi

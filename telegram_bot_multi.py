@@ -466,6 +466,9 @@ def _send_tmux_selection(session_name: str, choice_num: str) -> None:
 
     try:
         num = int(choice_num)
+        # 防禦性上界：callback_data 為 bot 自產，選項數不會超過此值
+        if not (1 <= num <= 50):
+            return
         session_config = bot_state.session_manager.get_session(session_name)
         if not session_config:
             return
@@ -494,8 +497,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    user_id = str(update.effective_user.id)
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+    if not check_user_permission(update):
         await query.edit_message_text(t('bot.unauthorized'))
         return
 
@@ -509,7 +511,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 按鍵序列含 subprocess + sleep，移到執行緒避免阻塞 event loop
         await asyncio.to_thread(_send_tmux_selection, session_name, choice_num)
-        _poll_last_sent[session_name] = time.time()
+        _mark_poll_sent(session_name)
 
         await query.edit_message_text(
             text=f"{query.message.text}\n\n✏️ {t('callback.text_input_hint', session=session_name)}",
@@ -525,7 +527,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 按鍵序列含 subprocess + sleep，移到執行緒避免阻塞 event loop
         await asyncio.to_thread(_send_tmux_selection, session_name, choice_num)
-        _poll_last_sent[session_name] = time.time()
+        _mark_poll_sent(session_name)
 
         await query.edit_message_text(
             text=f"{query.message.text}\n\n{t('callback.selected', session=session_name, choice=choice_num)}",
@@ -550,7 +552,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    _poll_last_sent[session_name] = time.time()
+    _mark_poll_sent(session_name)
 
     await query.edit_message_text(
         text=f"{query.message.text}\n\n{t('callback.selected', session=session_name, choice=choice)}",
@@ -609,16 +611,22 @@ def load_sessions_config():
             logger.error(t('bridge.config_error', file=SESSIONS_CONFIG_FILE))
             sys.exit(1)
 
+        loaded = 0
         for session in config['sessions']:
-            name = session['name']
+            # YAML 可能把 name 解析成 int/bool（如 name: 2024、name: no），先驗型別
+            name = session.get('name')
+            if not isinstance(name, str) or not patterns.is_safe_session_name(name):
+                logger.warning(t('bridge.invalid_session_name', name=name))
+                continue
             path = session['path']
             tmux = session.get('tmux')
             cli_type = session.get('cli_type', 'claude')
             cli_args = session.get('cli_args', session.get('claude_args', ''))
 
             session_manager.add_session(name, path, tmux, cli_args, cli_type)
+            loaded += 1
 
-        logger.info(t('bridge.config_loaded', count=len(config['sessions'])))
+        logger.info(t('bridge.config_loaded', count=loaded))
 
     except FileNotFoundError:
         logger.error(t('bridge.config_not_found', file=SESSIONS_CONFIG_FILE))
@@ -640,8 +648,16 @@ def reload_sessions_config():
         if not new_config or 'sessions' not in new_config:
             return False, t('bridge.config_format_error', file=SESSIONS_CONFIG_FILE), {}
 
+        valid_sessions = []
+        for session in new_config['sessions']:
+            name = session.get('name')
+            if isinstance(name, str) and patterns.is_safe_session_name(name):
+                valid_sessions.append(session)
+            else:
+                logger.warning(t('bridge.invalid_session_name', name=name))
+
         old_sessions = set(bot_state.session_manager.get_all_sessions())
-        new_sessions_config = {s['name']: s for s in new_config['sessions']}
+        new_sessions_config = {s['name']: s for s in valid_sessions}
         new_sessions = set(new_sessions_config.keys())
 
         added = new_sessions - old_sessions
@@ -664,7 +680,7 @@ def reload_sessions_config():
         # 創建新的 SessionManager
         new_manager = SessionManager()
 
-        for session in new_config['sessions']:
+        for session in valid_sessions:
             name = session['name']
             path = session['path']
             tmux = session.get('tmux')
@@ -707,7 +723,12 @@ def log_rotation_worker():
                 try:
                     if log_file.stat().st_size > app_config.tmux.LOG_MAX_SIZE:
                         data = log_file.read_bytes()[-app_config.tmux.LOG_KEEP_SIZE:]
-                        log_file.write_bytes(data)
+                        # 就地 r+b 先寫後截斷：不可換檔（pipe-pane 的 fd 會指向孤立
+                        # inode），也不用 O_TRUNC（先清空，crash 即全丟）；
+                        # 此寫法 crash 最多殘留舊尾段
+                        with open(log_file, 'r+b') as f:
+                            f.write(data)
+                            f.truncate(len(data))
                         logger.info(t('bridge.log_truncated', name=log_file.name))
                 except Exception as e:
                     logger.debug(f"Log rotation error for {log_file}: {e}")
@@ -723,6 +744,12 @@ _poll_file_state: dict = {}  # {session_name: (st_size, st_mtime)}，檔案未�
 _POLL_HASH_MAX_SIZE = app_config.tmux.POLL_HASH_MAX_SIZE
 _POLL_HASH_TTL = app_config.tmux.POLL_HASH_TTL
 POLL_COOLDOWN = app_config.tmux.POLL_COOLDOWN
+
+
+def _mark_poll_sent(session_name: str) -> None:
+    """記錄互動選項已處理的時間（必須持 _poll_lock，防與輪詢執行緒競態）"""
+    with _poll_lock:
+        _poll_last_sent[session_name] = time.time()
 
 def _capture_tmux_pane(session_name: str) -> str:
     """用 tmux capture-pane 取得渲染後的螢幕內容（適用於 ink/React TUI）"""
@@ -847,7 +874,7 @@ def interaction_polling_worker():
                     if resp.ok:
                         logger.info(f"Sent interaction buttons for #{name}")
                     else:
-                        logger.warning(f"Failed to send buttons: {resp.text}")
+                        logger.warning(f"Failed to send buttons: {redact_token(resp.text)}")
                 except Exception as e:
                     logger.warning(f"Failed to send interaction buttons: {redact_token(e)}")
 

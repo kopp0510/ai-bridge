@@ -111,7 +111,7 @@
 
 1. **CLI 已登入**：在終端執行 `claude`、`gemini` 或 `codex` 確認可正常互動（非登入畫面）
 2. **tmux 已安裝**：`tmux -V`
-3. **Python 3.8+**：`python3 --version`
+3. **Python 3.11+**（使用標準庫 `tomllib`）：`python3 --version`
 
 ### 1. 安裝依賴
 
@@ -121,6 +121,9 @@ brew install tmux
 
 # 安裝 Python 依賴
 pip install -r requirements.txt
+
+# （開發/執行測試時才需要）
+pip install -r requirements-dev.txt
 ```
 
 ### 2. 創建 Telegram Bot
@@ -356,14 +359,15 @@ AI_BRIDGE_LANGUAGE=zh-TW
 - `bridge.sh` - 統一管理工具（start/stop/restart/status/logs/validate）
 - `sessions.yaml` - 會話配置
 - `.env` - 環境變數
-- `requirements.txt` - Python 依賴
+- `requirements.txt` - Python 執行期依賴
+- `requirements-dev.txt` - 開發/測試依賴
 
 ## 安全建議
 
 1. **限制用戶**：`ALLOWED_USER_IDS` 為必填項，未設定時 Bot 拒絕啟動
 2. **保護配置**：`.env` 加入 `.gitignore`，不要提交敏感資訊
 3. **Shell 注入防護**：所有傳入 tmux 的參數使用 `shlex.quote()` 跳脫
-4. **鎖定依賴版本**：`requirements.txt` 鎖定精確版本，防止供應鏈攻擊
+4. **鎖定依賴版本**：`requirements.txt` 鎖定精確版本以防供應鏈攻擊；僅 `requests` 使用 `>=` 下限，以自動取得安全修補
 5. **工作目錄權限**：確保專案目錄權限正確，日誌檔案權限為 `0o600`
 6. **網絡安全**：使用 Polling 模式，無需公開網址
 

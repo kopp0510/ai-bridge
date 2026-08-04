@@ -1,0 +1,6 @@
+# 開發/測試依賴（含核心依賴）
+-r requirements.txt
+
+pytest==9.0.2
+pytest-cov==7.1.0
+pytest-asyncio==1.3.0
